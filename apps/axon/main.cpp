@@ -1,9 +1,12 @@
 #include <signal.h>
+#include <sys/random.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <charconv>
+#include <chrono>
 #include <cstdint>
 #include <exception>
 #include <filesystem>
@@ -28,6 +31,7 @@ namespace {
 
 constexpr std::string_view usage =
     "usage: axon serve --root DIR [--port PORT] [--bind ADDRESS]\n"
+    "                  [--fail-prob P [--seed N]]   cut connections on purpose, for testing\n"
     "       axon fetch HOST[:PORT] TOPIC [--output DIR]\n"
     "       axon list HOST[:PORT]\n"
     "       axon --version\n";
@@ -57,6 +61,32 @@ Options parse_options(std::span<char* const> args, std::initializer_list<std::st
         }
     }
     return out;
+}
+
+double parse_probability(std::string_view s) {
+    double p = 0;
+    const auto [end, ec] = std::from_chars(s.data(), s.data() + s.size(), p);
+    if (ec != std::errc{} || end != s.data() + s.size() || !(p >= 0 && p <= 1)) {
+        throw UsageError(std::format("--fail-prob needs a number from 0 to 1, not '{}'", s));
+    }
+    return p;
+}
+
+std::uint64_t parse_seed(std::string_view s) {
+    std::uint64_t seed = 0;
+    const auto [end, ec] = std::from_chars(s.data(), s.data() + s.size(), seed);
+    if (ec != std::errc{} || end != s.data() + s.size()) {
+        throw UsageError(std::format("--seed needs a whole number, not '{}'", s));
+    }
+    return seed;
+}
+
+std::uint64_t random_seed() {
+    std::uint64_t seed = 0;
+    if (::getrandom(&seed, sizeof seed, 0) != static_cast<ssize_t>(sizeof seed)) {
+        seed = static_cast<std::uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
+    }
+    return seed;
 }
 
 // "5.0 MB": decimal units, to match MB/s.
@@ -100,9 +130,18 @@ void install_signal_handlers() {
 // --- commands ---
 
 int serve(std::span<char* const> args) {
-    const Options opts = parse_options(args, {"--root", "--port", "--bind"});
+    const Options opts =
+        parse_options(args, {"--root", "--port", "--bind", "--fail-prob", "--seed"});
     if (!opts.contains("--root")) {
         throw UsageError("serve needs --root DIR");
+    }
+    if (opts.contains("--seed") && !opts.contains("--fail-prob")) {
+        throw UsageError("--seed only makes sense with --fail-prob");
+    }
+    axon::ServerConfig config;
+    if (opts.contains("--fail-prob")) {
+        config.fault.probability = parse_probability(opts.at("--fail-prob"));
+        config.fault.seed = opts.contains("--seed") ? parse_seed(opts.at("--seed")) : random_seed();
     }
     const std::uint16_t port =
         opts.contains("--port") ? axon::parse_port(opts.at("--port")) : default_port;
@@ -119,9 +158,13 @@ int serve(std::span<char* const> args) {
     }
     const std::size_t topics = dataset.topics().size();
 
-    axon::Server server{std::move(dataset), axon::Listener::listen(bind, port)};
+    axon::Server server{std::move(dataset), axon::Listener::listen(bind, port), config};
     axon::log_msg("serving {} topic(s), {} file(s) on {}:{} (Ctrl+C to stop)", topics, files, bind,
                   server.port());
+    if (config.fault.probability > 0) {
+        axon::log_msg("fault injection: each connection is cut with probability {} (--seed {})",
+                      config.fault.probability, config.fault.seed);
+    }
     g_server.store(&server);
     if (g_stop_requested.load()) {
         server.stop();  // Ctrl+C arrived while scanning

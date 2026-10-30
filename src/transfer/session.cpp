@@ -24,7 +24,20 @@ std::uint64_t random_id() {
 }  // namespace
 
 Session::Session(std::uint64_t id, const Topic& topic)
-    : id_{id}, topic_{&topic}, max_sent_(topic.files.size(), 0) {}
+    : id_{id}, topic_{&topic}, max_sent_(topic.files.size(), 0) {
+    for (const auto& f : topic.files) {
+        total_bytes_ += f.size;
+    }
+}
+
+std::uint64_t Session::bytes_left() const {
+    const std::lock_guard lock{mu_};
+    std::uint64_t sent = 0;
+    for (const std::uint64_t high : max_sent_) {
+        sent += high;
+    }
+    return total_bytes_ - sent;
+}
 
 void Session::connected() {
     const std::lock_guard lock{mu_};

@@ -15,6 +15,7 @@
 #include <utility>
 #include <vector>
 
+#include "axon/fault/fault.hpp"
 #include "axon/log.hpp"
 #include "axon/protocol/bytes.hpp"
 #include "axon/protocol/frame.hpp"
@@ -41,8 +42,17 @@ public:
 
 [[noreturn]] void reject(ErrCode code, const std::string& reason) { throw Rejection{code, reason}; }
 
+// Fault injection cut the connection on purpose.
+class InjectedCut : public std::runtime_error {
+public:
+    explicit InjectedCut(std::uint64_t at)
+        : std::runtime_error{std::format("fault injection cut the connection after {} file bytes", at)} {}
+};
+
 // Streams one requested range as DATA frames, recording them in `session`.
-void send_range(Socket& sock, Session& session, const Range& r, std::vector<std::byte>& buf) {
+// When `fault` says so, the last frame is cut short and InjectedCut thrown.
+void send_range(Socket& sock, Session& session, const Range& r, std::vector<std::byte>& buf,
+                FaultPlan& fault) {
     const Topic& topic = session.topic();
     if (r.file_id >= topic.files.size()) {
         reject(ErrCode::BadRange, std::format("no file with id {}", r.file_id));
@@ -73,8 +83,16 @@ void send_range(Socket& sock, Session& session, const Range& r, std::vector<std:
         if (n == 0) {
             reject(ErrCode::Internal, std::format("{} shrank since the server started", entry.name));
         }
-        send_message(sock, Data{.file_id = r.file_id, .offset = pos, .bytes = std::span{buf}.first(n)});
+        const Data data{.file_id = r.file_id, .offset = pos, .bytes = std::span{buf}.first(n)};
+        if (const std::size_t allowed = fault.allow(n); allowed < n) {
+            // The header announces all n bytes; only `allowed` of them follow.
+            send_truncated(sock, data, data_header_len + allowed);
+            session.record_sent(r.file_id, pos, allowed);
+            throw InjectedCut{fault.cut_at()};
+        }
+        send_message(sock, data);
         session.record_sent(r.file_id, pos, n);
+        fault.sent(n);
         pos += n;
     }
 }
@@ -122,7 +140,7 @@ ServerStats Server::stats() const {
 
 // One client: LIST -> TOPS, or GET -> OK, then REQ ... (answered with DATA)
 // until ACK. A GET with a session id resumes that session.
-void Server::serve_client(Socket& sock, const std::string& who) {
+void Server::serve_client(Socket& sock, std::uint64_t conn_id, const std::string& who) {
     MessageReader reader{max_request_len};
     const auto first = reader.read(sock);
     if (!first) {
@@ -168,12 +186,13 @@ void Server::serve_client(Socket& sock, const std::string& who) {
     session->connected();
     ok.session_id = session->id();
     send_message(sock, ok);
+    FaultPlan fault{config_.fault, conn_id, session->bytes_left()};
 
     std::vector<std::byte> buf(max_data_len);
     while (const auto msg = reader.read(sock)) {
         if (const auto* req = std::get_if<Req>(&*msg)) {
             for (const Range& r : req->ranges) {
-                send_range(sock, *session, r, buf);
+                send_range(sock, *session, r, buf, fault);
             }
         } else if (std::holds_alternative<Ack>(*msg)) {
             finish(*session, who);
@@ -261,7 +280,9 @@ void Server::serve(Conn& conn) {
     const std::string who = std::format("conn {}", conn.id);
     try {
         conn.sock.set_timeouts(config_.idle_timeout);
-        serve_client(conn.sock, who);
+        serve_client(conn.sock, conn.id, who);
+    } catch (const InjectedCut& e) {
+        log_msg("{}: {}", who, e.what());
     } catch (const Rejection& r) {
         log_msg("{}: refused, {}: {}", who, proto::to_string(r.code), r.what());
         try {

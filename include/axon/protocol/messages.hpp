@@ -16,6 +16,7 @@ inline constexpr std::size_t max_topic_len = 255;
 inline constexpr std::size_t max_name_len = 255;
 inline constexpr std::size_t max_req_ranges = 16;
 inline constexpr std::size_t max_data_len = 64 * 1024;
+inline constexpr std::size_t data_header_len = 4 + 8;  // DATA payload before the file bytes
 
 // Message type on the wire: four ASCII characters, readable in a hex dump.
 constexpr std::uint32_t tag(const char (&s)[5]) {

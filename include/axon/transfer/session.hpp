@@ -39,9 +39,13 @@ public:
     [[nodiscard]] SessionStats stats() const;
     [[nodiscard]] Clock::time_point last_active() const;
 
+    // File bytes of the topic not yet sent in this session.
+    [[nodiscard]] std::uint64_t bytes_left() const;
+
 private:
     const std::uint64_t id_;
     const Topic* topic_;
+    std::uint64_t total_bytes_ = 0;  // set once in the constructor
     const Clock::time_point started_ = Clock::now();
     mutable std::mutex mu_;
     std::vector<std::uint64_t> max_sent_;  // per file, guarded by mu_

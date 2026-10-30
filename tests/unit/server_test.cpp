@@ -100,6 +100,30 @@ std::string receive(Socket& sock, MessageReader& reader, std::uint32_t id, std::
     return out;
 }
 
+// What one connection delivered before it ended.
+struct Delivery {
+    std::string bytes;           // file bytes of complete DATA frames, in order
+    bool cut_mid_frame = false;  // the stream ended inside a frame
+};
+
+// Reads DATA frames until `length` bytes arrived or the connection ends.
+Delivery receive_until_cut(Socket& sock, MessageReader& reader, std::uint64_t length) {
+    Delivery d;
+    try {
+        while (d.bytes.size() < length) {
+            const auto msg = reader.read(sock);
+            if (!msg) {
+                break;
+            }
+            const auto& data = std::get<Data>(*msg);
+            d.bytes.append(reinterpret_cast<const char*>(data.bytes.data()), data.bytes.size());
+        }
+    } catch (const axon::ConnectionClosed&) {
+        d.cut_mid_frame = true;
+    }
+    return d;
+}
+
 // --- the happy path ---
 
 TEST_F(ServerTest, ServesListAndRangesUntilAck) {
@@ -220,6 +244,59 @@ TEST_F(ServerTest, AbandonedSessionExpires) {
     auto sock = connect();
     EXPECT_EQ(expect_err(sock, Get{.topic = "animals", .session_id = session}).code,
               ErrCode::SessionNotFound);
+}
+
+// --- fault injection ---
+
+TEST_F(ServerTest, FaultInjectionCutsInsideADataFrame) {
+    start({.idle_timeout = 5s, .fault = {.probability = 1, .seed = 7}});
+    auto sock = connect();
+    MessageReader reader;
+    (void)ask(sock, reader, Get{.topic = "animals"});
+    // Ask for every byte of the topic, so the cut point (drawn over all of it) is inside.
+    send_message(sock, Req{{{.file_id = 0, .offset = 0, .length = big.size()},
+                            {.file_id = 1, .offset = 0, .length = 4}}});
+    const Delivery d = receive_until_cut(sock, reader, big.size() + 4);
+    EXPECT_TRUE(d.cut_mid_frame) << "the stream should end inside a DATA frame";
+    EXPECT_LT(d.bytes.size(), big.size() + 4);
+}
+
+TEST_F(ServerTest, ListIsNeverCut) {
+    start({.idle_timeout = 5s, .fault = {.probability = 1, .seed = 7}});
+    auto sock = connect();
+    MessageReader reader;
+    EXPECT_TRUE(std::holds_alternative<Topics>(ask(sock, reader, List{})));
+}
+
+TEST_F(ServerTest, ResumingThroughRepeatedCutsDeliversEveryByteOnce) {
+    start({.idle_timeout = 5s, .fault = {.probability = 0.8, .seed = 11}});
+    std::string got;
+    std::uint64_t session = 0;
+    int attempts = 0;
+    int cuts = 0;
+    while (got.size() < big.size()) {
+        ASSERT_LT(++attempts, 50) << "no progress";
+        auto sock = connect();
+        MessageReader reader;
+        session = std::get<Ok>(ask(sock, reader, Get{.topic = "animals", .session_id = session}))
+                      .session_id;
+        const std::uint64_t at = got.size();
+        send_message(sock, Req{{{.file_id = 0, .offset = at, .length = big.size() - at}}});
+        const Delivery d = receive_until_cut(sock, reader, big.size() - at);
+        got += d.bytes;
+        cuts += d.cut_mid_frame ? 1 : 0;
+        if (!d.cut_mid_frame && got.size() == big.size()) {
+            send_message(sock, Ack{});
+            EXPECT_FALSE(reader.read(sock).has_value());
+        }
+    }
+    EXPECT_EQ(got, big);
+    EXPECT_GE(cuts, 2) << "with p = 0.8 several connections should have been cut";
+
+    server_->stop();
+    const auto stats = server_->stats();
+    EXPECT_EQ(stats.sessions_finished, 1u);
+    EXPECT_EQ(stats.payload_bytes - stats.redundant_bytes, big.size());
 }
 
 TEST_F(ServerTest, ServesManyClientsAtOnce) {

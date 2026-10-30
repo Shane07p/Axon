@@ -16,6 +16,7 @@ add_executable(axon_unit_tests
     unit/crc32_test.cpp
     unit/dataset_test.cpp
     unit/endpoint_test.cpp
+    unit/fault_test.cpp
     unit/fd_test.cpp
     unit/file_test.cpp
     unit/frame_test.cpp

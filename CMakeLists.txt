@@ -36,6 +36,7 @@ find_package(Threads REQUIRED)
 
 # Core library: everything except the CLI lives here so tests can link it.
 add_library(axon_core
+    src/fault/fault.cpp
     src/fd.cpp
     src/log.cpp
     src/net/endpoint.cpp

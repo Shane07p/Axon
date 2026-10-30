@@ -8,6 +8,7 @@
 #include <string>
 #include <thread>
 
+#include "axon/fault/fault.hpp"
 #include "axon/fd.hpp"
 #include "axon/net/socket.hpp"
 #include "axon/storage/dataset.hpp"
@@ -20,6 +21,8 @@ struct ServerConfig {
     std::chrono::milliseconds idle_timeout{std::chrono::seconds{60}};
     // A session no connection has used for this long can no longer be resumed.
     std::chrono::milliseconds session_ttl{std::chrono::minutes{10}};
+    // For testing recovery: cut connections on purpose (probability 0 = never).
+    FaultConfig fault{};
 };
 
 // Totals over sessions that finished (the client sent ACK).
@@ -57,7 +60,7 @@ private:
 
     void spawn(Socket sock);
     void serve(Conn& conn);  // runs on the connection's thread
-    void serve_client(Socket& sock, const std::string& who);
+    void serve_client(Socket& sock, std::uint64_t conn_id, const std::string& who);
     void finish(const Session& session, const std::string& who);
     void reap();  // joins connections whose thread has finished
     void close_all() noexcept;

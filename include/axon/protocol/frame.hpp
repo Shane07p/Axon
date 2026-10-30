@@ -17,6 +17,11 @@ inline constexpr std::size_t default_max_payload = 16 * 1024 * 1024;
 // Encodes `msg` and sends it as one frame.
 void send_message(Socket& sock, const Message& msg);
 
+// Sends a frame whose header announces all of `msg` but which carries only
+// its first `payload_bytes` bytes: a deliberately cut frame, for fault
+// injection.
+void send_truncated(Socket& sock, const Message& msg, std::size_t payload_bytes);
+
 // Reads frames into a buffer it reuses, so receiving needs no allocation per
 // message. Not tied to one socket: keep it across reconnects.
 class MessageReader {
