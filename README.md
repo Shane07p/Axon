@@ -6,8 +6,9 @@ A nerve is a bundle of axons carrying signals side by side. Axon bundles
 several TCP connections into one download, and if one is cut the others keep
 going and the transfer resumes from the exact byte.
 
-> Status: work in progress. The server (`axon serve`) works; the client
-> (`axon fetch`, `axon list`) comes next.
+> Status: work in progress. `axon serve` and `axon fetch` work over one
+> connection; resume after a dropped connection and parallel connections come
+> next.
 
 ## Run
 
@@ -25,6 +26,15 @@ axon serve --root ./datasets --port 9000
 
 Ctrl+C stops the server cleanly (a second Ctrl+C forces it). Symlinks,
 nested folders and unreadable files are skipped with a warning.
+
+```sh
+axon fetch localhost:9000 animals --output ./downloads
+# fetched animals: <files>, <size> in <seconds> (<MB/s>) into downloads/animals
+```
+
+Each file is downloaded to a hidden temporary file, checked against the CRC-32
+the server announced, and only then renamed to its real name, so a file you
+see is always complete. Other files in the folder are left alone.
 
 ## Build
 
@@ -57,6 +67,6 @@ include/axon/    public headers of the core library
 src/net/         sockets
 src/protocol/    message encoding and framing
 src/storage/     files and the dataset scanner
-src/transfer/    server (client to come)
+src/transfer/    server and client
 tests/unit/      GoogleTest unit tests
 ```

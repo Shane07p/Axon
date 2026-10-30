@@ -2,8 +2,8 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
-#include <charconv>
 #include <cstdint>
 #include <exception>
 #include <filesystem>
@@ -17,8 +17,10 @@
 #include <string_view>
 
 #include "axon/log.hpp"
+#include "axon/net/endpoint.hpp"
 #include "axon/net/socket.hpp"
 #include "axon/storage/dataset.hpp"
+#include "axon/transfer/client.hpp"
 #include "axon/transfer/server.hpp"
 #include "axon/version.hpp"
 
@@ -26,6 +28,7 @@ namespace {
 
 constexpr std::string_view usage =
     "usage: axon serve --root DIR [--port PORT] [--bind ADDRESS]\n"
+    "       axon fetch HOST[:PORT] TOPIC [--output DIR]\n"
     "       axon --version\n";
 
 constexpr std::uint16_t default_port = 9000;
@@ -55,13 +58,16 @@ Options parse_options(std::span<char* const> args, std::initializer_list<std::st
     return out;
 }
 
-std::uint16_t parse_port(std::string_view s) {
-    unsigned value = 0;
-    const auto [end, ec] = std::from_chars(s.data(), s.data() + s.size(), value);
-    if (ec != std::errc{} || end != s.data() + s.size() || value > 65535) {
-        throw UsageError(std::format("invalid port '{}'", s));
+// "5.0 MB": decimal units, to match MB/s.
+std::string human_bytes(std::uint64_t n) {
+    constexpr std::array<std::string_view, 5> units{"B", "KB", "MB", "GB", "TB"};
+    auto value = static_cast<double>(n);
+    std::size_t unit = 0;
+    while (value >= 1000 && unit + 1 < units.size()) {
+        value /= 1000;
+        ++unit;
     }
-    return static_cast<std::uint16_t>(value);
+    return unit == 0 ? std::format("{} B", n) : std::format("{:.1f} {}", value, units[unit]);
 }
 
 // --- Ctrl+C ---
@@ -97,7 +103,8 @@ int serve(std::span<char* const> args) {
     if (!opts.contains("--root")) {
         throw UsageError("serve needs --root DIR");
     }
-    const std::uint16_t port = opts.contains("--port") ? parse_port(opts.at("--port")) : default_port;
+    const std::uint16_t port =
+        opts.contains("--port") ? axon::parse_port(opts.at("--port")) : default_port;
     const std::string bind{opts.contains("--bind") ? opts.at("--bind") : "0.0.0.0"};
     install_signal_handlers();
 
@@ -124,6 +131,25 @@ int serve(std::span<char* const> args) {
     return 0;
 }
 
+int fetch(std::span<char* const> args) {
+    if (args.size() < 2) {
+        throw UsageError("fetch needs HOST[:PORT] and TOPIC");
+    }
+    const axon::Endpoint server = axon::parse_endpoint(args[0], default_port);
+    const std::string topic{args[1]};
+    const Options opts = parse_options(args.subspan(2), {"--output"});
+    const std::filesystem::path output{opts.contains("--output") ? opts.at("--output") : "."};
+
+    const axon::FetchStats stats =
+        axon::fetch({.host = server.host, .port = server.port, .topic = topic, .output = output});
+    const double secs = stats.elapsed.count();
+    std::cout << std::format("fetched {}: {} file(s), {} in {:.2f} s ({:.1f} MB/s) into {}\n", topic,
+                             stats.files, human_bytes(stats.bytes), secs,
+                             static_cast<double>(stats.bytes) / 1e6 / std::max(secs, 1e-9),
+                             (output / topic).string());
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char* argv[]) {
@@ -145,9 +171,15 @@ int main(int argc, char* argv[]) {
         if (command == "serve") {
             return serve(args.subspan(1));
         }
+        if (command == "fetch") {
+            return fetch(args.subspan(1));
+        }
         throw UsageError(std::format("unknown command '{}'", command));
     } catch (const UsageError& e) {
         std::cerr << "axon: " << e.what() << '\n' << usage;
+        return 2;
+    } catch (const std::invalid_argument& e) {  // a malformed port, address or topic
+        std::cerr << "axon: " << e.what() << '\n';
         return 2;
     } catch (const std::exception& e) {
         std::cerr << "axon: error: " << e.what() << '\n';

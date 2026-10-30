@@ -38,12 +38,14 @@ find_package(Threads REQUIRED)
 add_library(axon_core
     src/fd.cpp
     src/log.cpp
+    src/net/endpoint.cpp
     src/net/socket.cpp
     src/protocol/bytes.cpp
     src/protocol/frame.cpp
     src/protocol/messages.cpp
     src/storage/dataset.cpp
     src/storage/file.cpp
+    src/transfer/client.cpp
     src/transfer/server.cpp
     src/version.cpp)
 target_include_directories(axon_core PUBLIC include PRIVATE src)

@@ -102,7 +102,7 @@ void serve_client(Socket& sock, const Dataset& dataset, const std::string& who) 
         reject(ErrCode::UnknownTopic, std::format("no topic named '{}'", get->topic));
     }
     send_message(sock, Ok{.files = topic->files});
-    log_msg("{}: GET {} ({} files)", who, topic->name, topic->files.size());
+    log_msg("{}: GET {}, {} file(s)", who, topic->name, topic->files.size());
 
     const auto start = std::chrono::steady_clock::now();
     std::vector<std::byte> buf(max_data_len);
@@ -173,7 +173,8 @@ void Server::run() {
     std::size_t open = 0;
     {
         const std::lock_guard lock{mu_};
-        open = conns_.size();
+        open = static_cast<std::size_t>(
+            std::ranges::count_if(conns_, [](const Conn& c) { return !c.done.load(); }));
     }
     log_msg("stopping: closing {} connection(s)", open);
     close_all();

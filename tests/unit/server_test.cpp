@@ -4,7 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
-#include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <thread>
@@ -17,6 +17,7 @@
 #include "axon/protocol/frame.hpp"
 #include "axon/storage/dataset.hpp"
 #include "axon/transfer/server.hpp"
+#include "test_servers.hpp"
 #include "test_util.hpp"
 
 namespace {
@@ -25,8 +26,6 @@ namespace fs = std::filesystem;
 using namespace axon::proto;
 using namespace std::chrono_literals;
 using axon::Dataset;
-using axon::Listener;
-using axon::Server;
 using axon::ServerConfig;
 using axon::Socket;
 using axon::test::write_file;
@@ -51,25 +50,16 @@ protected:
         write_file(dir_ / "animals" / "empty.txt", "");
     }
 
-    void start(ServerConfig config = {.idle_timeout = 5s}) {
-        server_ = std::make_unique<Server>(Dataset::scan(dir_), Listener::listen("127.0.0.1", 0),
-                                           config);
-        thread_ = std::jthread{[this] { server_->run(); }};
-    }
+    void start(ServerConfig config = {.idle_timeout = 5s}) { server_.emplace(dir_, config); }
 
     void TearDown() override {
-        if (server_) {
-            server_->stop();
-            thread_.join();
-            server_.reset();
-        }
+        server_.reset();
         TempDirTest::TearDown();  // also checks the server closed every descriptor
     }
 
     Socket connect() const { return Socket::connect("127.0.0.1", server_->port()); }
 
-    std::unique_ptr<Server> server_;
-    std::jthread thread_;
+    std::optional<axon::test::LiveServer> server_;
 };
 
 Message ask(Socket& sock, MessageReader& reader, const Message& msg) {
@@ -235,8 +225,7 @@ TEST_F(ServerTest, StopClosesConnectedClientsPromptly) {
     (void)ask(mid, reader, Get{.topic = "animals"});
 
     const auto t0 = std::chrono::steady_clock::now();
-    server_->stop();
-    thread_.join();  // run() returns only after every connection thread is joined
+    server_->stop();  // returns once run() has joined every connection thread
     EXPECT_LT(std::chrono::steady_clock::now() - t0, 2s);
 
     MessageReader r2;
