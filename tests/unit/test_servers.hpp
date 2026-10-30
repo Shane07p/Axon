@@ -7,6 +7,7 @@
 #include <functional>
 #include <thread>
 #include <utility>
+#include <vector>
 
 #include "axon/net/socket.hpp"
 #include "axon/storage/dataset.hpp"
@@ -41,20 +42,28 @@ private:
     std::jthread thread_;
 };
 
-// Accepts `connections` connections one after another and runs `script` on
-// each (with its index, from 0), on its own thread: a server that misbehaves
-// on purpose.
+// Accepts `connections` connections and runs `script` on each (with its
+// index, from 0, in accept order), each on its own thread so parallel clients
+// work: a server that misbehaves on purpose.
 class FakeServer {
 public:
     explicit FakeServer(std::function<void(Socket&, int)> script, int connections)
         : listener_{Listener::listen("127.0.0.1", 0)},
           thread_{[this, script = std::move(script), connections] {
+              std::vector<std::jthread> handlers;
               for (int i = 0; i < connections; ++i) {
+                  Socket sock;
                   try {
-                      Socket sock = listener_.accept();
-                      script(sock, i);
-                  } catch (const std::exception&) {  // the client hung up first
+                      sock = listener_.accept();
+                  } catch (const std::exception&) {
+                      break;
                   }
+                  handlers.emplace_back([&script, i, s = std::move(sock)]() mutable {
+                      try {
+                          script(s, i);
+                      } catch (const std::exception&) {  // the client hung up first
+                      }
+                  });
               }
           }} {}
 

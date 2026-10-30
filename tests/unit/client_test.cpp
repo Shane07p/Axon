@@ -1,12 +1,14 @@
 #include <sys/socket.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <format>
 #include <fstream>
 #include <iterator>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -222,10 +224,12 @@ std::string patterned(std::size_t n) {
     return s;
 }
 
-void send_frames(Socket& sock, std::string_view content, std::size_t from, std::size_t frames) {
+// Sends up to `frames` DATA frames of file `id` from byte `from`.
+void send_frames(Socket& sock, std::string_view content, std::size_t from, std::size_t frames,
+                 std::uint32_t id = 0) {
     for (std::size_t f = 0; f < frames && from < content.size(); ++f) {
         const std::size_t n = std::min(max_data_len, content.size() - from);
-        send_message(sock, Data{.file_id = 0, .offset = from, .bytes = bytes(content.substr(from, n))});
+        send_message(sock, Data{.file_id = id, .offset = from, .bytes = bytes(content.substr(from, n))});
         from += n;
     }
 }
@@ -372,6 +376,242 @@ TEST_F(FetchTest, DiskErrorsAreNotRetried) {
                                                            std::chrono::milliseconds) { ++retries; }}),
                  fs::filesystem_error);
     EXPECT_EQ(retries, 0u);
+}
+
+// --- parallel connections ---
+
+// A topic of `files` files of varied size, two of them large.
+std::uint64_t write_topic(const fs::path& dir, int files) {
+    std::uint64_t total = 0;
+    for (int i = 0; i < files; ++i) {
+        const std::size_t size = i < 2 ? 1'000'000 : static_cast<std::size_t>(i) * 2'500;
+        std::string content(size, '\0');
+        for (std::size_t b = 0; b < size; ++b) {
+            content[b] = static_cast<char>((b * 31 + static_cast<std::size_t>(i)) % 256);
+        }
+        write_file(dir / std::format("f{:03}.bin", i), content);
+        total += size;
+    }
+    return total;
+}
+
+TEST_F(FetchTest, ParallelDownloadsGiveIdenticalFiles) {
+    const std::uint64_t total = write_topic(data() / "t", 42);
+    for (const std::size_t n : {1u, 2u, 4u, 8u}) {
+        SCOPED_TRACE(std::format("{} connection(s)", n));
+        fs::remove_all(out());
+        LiveServer server{data()};
+        const FetchStats stats = axon::fetch(
+            {.host = "127.0.0.1", .port = server.port(), .topic = "t", .output = out(), .connections = n,
+             .timeout = 5s});
+        expect_identical("t");
+        EXPECT_EQ(stats.bytes, total);
+        EXPECT_EQ(stats.connections, n) << "each connection joins once when nothing fails";
+        server.stop();
+        EXPECT_EQ(server.stats().sessions_finished, 1u);
+        EXPECT_EQ(server.stats().redundant_bytes, 0u);
+    }
+}
+
+TEST_F(FetchTest, ParallelDownloadSurvivesFrequentCuts) {
+    const std::uint64_t total = write_topic(data() / "t", 42);
+    LiveServer server{data(), {.idle_timeout = 5s, .fault = {.probability = 0.7, .seed = 5}}};
+    const FetchStats stats = axon::fetch({.host = "127.0.0.1",
+                                          .port = server.port(),
+                                          .topic = "t",
+                                          .output = out(),
+                                          .connections = 4,
+                                          .timeout = 5s,
+                                          .retry = {.max_failures = 4, .first_delay = 1ms,
+                                                    .max_delay = 10ms}});
+    // How many cuts land depends on thread timing, so only what must always
+    // hold is checked here; ConnectionThatIsCutHandsItsFileToAnother pins the
+    // hand-over itself.
+    expect_identical("t");
+    EXPECT_GE(stats.connections, 4u);
+    server.stop();
+    EXPECT_EQ(server.stats().payload_bytes, total) << "every byte sent exactly once";
+    EXPECT_EQ(server.stats().redundant_bytes, 0u);
+}
+
+TEST_F(FetchTest, ConnectionThatIsCutHandsItsFileToAnother) {
+    const std::vector<std::string> content{patterned(300'000), patterned(20'000)};
+    const std::vector<FileEntry> files{{"big.bin", content[0].size(), crc_of(content[0])},
+                                       {"small.bin", content[1].size(), crc_of(content[1])}};
+    std::vector<Req> on_second;  // what the second connection was asked for
+    std::array<std::uint16_t, 2> hints{};
+    {
+        const FakeServer server{
+            [&](Socket& sock, int i) {
+                MessageReader reader;
+                hints[static_cast<std::size_t>(i)] = std::get<Get>(*reader.read(sock)).connections;
+                send_message(sock, Ok{.session_id = 7, .files = i == 0 ? std::optional{files}
+                                                                       : std::nullopt});
+                if (i == 0) {  // takes big.bin, then is cut 1000 bytes into its second frame
+                    const auto req = std::get<Req>(*reader.read(sock));
+                    EXPECT_EQ(req.ranges.at(0).file_id, 0u);
+                    send_frames(sock, content[0], 0, 1);
+                    const Data second{.file_id = 0,
+                                      .offset = max_data_len,
+                                      .bytes = bytes(std::string_view{content[0]}.substr(max_data_len,
+                                                                                         max_data_len))};
+                    send_truncated(sock, second, data_header_len + 1000);
+                    return;
+                }
+                while (const auto msg = reader.read(sock)) {
+                    if (std::holds_alternative<Ack>(*msg)) {
+                        return;
+                    }
+                    const auto& req = on_second.emplace_back(std::get<Req>(*msg));
+                    for (const Range& r : req.ranges) {
+                        send_frames(sock, content[r.file_id], r.offset, content[r.file_id].size(),
+                                    r.file_id);
+                    }
+                }
+            },
+            2};
+        // The cut connection backs off for seconds, so the other one takes
+        // big.bin over long before it could; it wakes as soon as all is done.
+        const auto t0 = std::chrono::steady_clock::now();
+        const FetchStats stats = axon::fetch({.host = "127.0.0.1",
+                                              .port = server.port(),
+                                              .topic = "t",
+                                              .output = out(),
+                                              .connections = 2,
+                                              .timeout = 5s,
+                                              .retry = {.first_delay = 6s, .max_delay = 6s}});
+        EXPECT_EQ(stats.connections, 2u) << "the cut connection found nothing left to do";
+        EXPECT_LT(std::chrono::steady_clock::now() - t0, 2s) << "it must not sleep out its backoff";
+    }
+    EXPECT_EQ(read_file(out() / "t" / "big.bin"), content[0]);
+    EXPECT_EQ(read_file(out() / "t" / "small.bin"), content[1]);
+    // Whether it fetched small.bin first depends on timing; either way the
+    // second connection asked for big.bin from the exact byte the first had.
+    const auto took_over = std::ranges::find_if(
+        on_second, [](const Req& r) { return r.ranges.at(0).file_id == 0; });
+    ASSERT_NE(took_over, on_second.end()) << "the second connection took big.bin over";
+    EXPECT_EQ(took_over->ranges.at(0).offset, max_data_len + 1000) << "at its exact byte";
+    EXPECT_EQ(hints, (std::array<std::uint16_t, 2>{2, 2})) << "each GET says how many connections share";
+}
+
+TEST_F(FetchTest, NoMoreConnectionsThanFiles) {
+    write_file(data() / "t" / "a.txt", "a");
+    write_file(data() / "t" / "b.txt", "b");
+    LiveServer server{data()};
+    const FetchStats stats = axon::fetch(
+        {.host = "127.0.0.1", .port = server.port(), .topic = "t", .output = out(), .connections = 8});
+    EXPECT_EQ(stats.connections, 2u);
+    expect_identical("t");
+}
+
+TEST_F(FetchTest, FatalErrorStopsEveryConnectionPromptly) {
+    write_topic(data() / "t", 30);
+    LiveServer server{data()};
+    fs::resize_file(data() / "t" / "f000.bin", 10);  // shrinks after the scan: the server reports it
+    std::size_t retries = 0;
+    const auto t0 = std::chrono::steady_clock::now();
+    EXPECT_THROW((void)axon::fetch({.host = "127.0.0.1",
+                                    .port = server.port(),
+                                    .topic = "t",
+                                    .output = out(),
+                                    .connections = 4,
+                                    .timeout = 20s,
+                                    .on_retry = [&retries](const std::string&,
+                                                           std::chrono::milliseconds) { ++retries; }}),
+                 axon::ServerError);
+    EXPECT_LT(std::chrono::steady_clock::now() - t0, 5s) << "the other connections must not linger";
+    EXPECT_EQ(retries, 0u) << "an abort is not a reconnect";
+}
+
+TEST_F(FetchTest, FatalErrorWakesAConnectionStuckOnASilentServer) {
+    const std::string good = patterned(1000);
+    const std::vector<FileEntry> files{{"slow.bin", 1000, crc_of(good)}, {"bad.bin", 3, 0}};
+    {
+        const FakeServer server{
+            [&](Socket& sock, int i) {
+                MessageReader reader;
+                (void)reader.read(sock);  // GET
+                send_message(sock, Ok{.session_id = 7, .files = i == 0 ? std::optional{files}
+                                                                       : std::nullopt});
+                const auto req = std::get<Req>(*reader.read(sock));
+                if (req.ranges.at(0).file_id == 1) {  // bad.bin: CRC will not match
+                    send_message(sock, Data{.file_id = 1, .offset = 0, .bytes = bytes("abc")});
+                }
+                while (reader.read(sock)) {  // slow.bin: say nothing, until the client hangs up
+                }
+            },
+            2};
+        const auto t0 = std::chrono::steady_clock::now();
+        EXPECT_THROW((void)axon::fetch({.host = "127.0.0.1",
+                                        .port = server.port(),
+                                        .topic = "t",
+                                        .output = out(),
+                                        .connections = 2,
+                                        .timeout = 20s}),
+                     axon::IntegrityError);
+        EXPECT_LT(std::chrono::steady_clock::now() - t0, 2s)
+            << "the connection waiting on slow.bin must be woken, not left to time out";
+    }
+}
+
+// Serves REQs for `content` (file id -> bytes) until ACK or the client leaves.
+void serve_requests(Socket& sock, MessageReader& reader, const std::vector<std::string>& content) {
+    while (const auto msg = reader.read(sock)) {
+        if (std::holds_alternative<Ack>(*msg)) {
+            return;
+        }
+        for (const Range& r : std::get<Req>(*msg).ranges) {
+            for (std::uint64_t pos = r.offset; pos < r.offset + r.length;) {
+                const std::size_t n = std::min<std::uint64_t>(max_data_len, r.offset + r.length - pos);
+                send_message(sock, Data{.file_id = r.file_id,
+                                        .offset = pos,
+                                        .bytes = bytes(std::string_view{content[r.file_id]}.substr(pos, n))});
+                pos += n;
+            }
+        }
+    }
+}
+
+TEST_F(FetchTest, SessionLostDuringAParallelDownloadStartsOver) {
+    const std::vector<std::string> content{patterned(100'000), patterned(50'000)};
+    const std::vector<FileEntry> files{{"a.bin", content[0].size(), crc_of(content[0])},
+                                       {"b.bin", content[1].size(), crc_of(content[1])}};
+    std::vector<Get> gets(4);
+    {
+        const FakeServer server{
+            [&](Socket& sock, int i) {
+                MessageReader reader;
+                gets[static_cast<std::size_t>(i)] = std::get<Get>(*reader.read(sock));
+                switch (i) {
+                    case 0:  // first session; sends nothing until the client hangs up,
+                             // which it does only by aborting after connection 1 is refused
+                        send_message(sock, Ok{.session_id = 7, .files = files});
+                        while (reader.read(sock)) {
+                        }
+                        return;
+                    case 1:  // the second connection finds the session gone
+                        send_message(sock, Err{.code = ErrCode::SessionNotFound, .reason = "gone"});
+                        return;
+                    default:  // a fresh session, served properly
+                        send_message(sock, Ok{.session_id = 8, .files = i == 2 ? std::optional{files}
+                                                                               : std::nullopt});
+                        serve_requests(sock, reader, content);
+                }
+            },
+            4};
+        (void)axon::fetch({.host = "127.0.0.1",
+                           .port = server.port(),
+                           .topic = "t",
+                           .output = out(),
+                           .connections = 2,
+                           .timeout = 5s,
+                           .retry = {.first_delay = 1ms, .max_delay = 1ms}});
+    }
+    EXPECT_EQ(read_file(out() / "t" / "a.bin"), content[0]);
+    EXPECT_EQ(read_file(out() / "t" / "b.bin"), content[1]);
+    EXPECT_EQ(gets[1].session_id, 7u);
+    EXPECT_EQ(gets[2].session_id, 0u) << "after the loss a new session is opened";
+    EXPECT_EQ(gets[3].session_id, 8u) << "and the second connection joins it";
 }
 
 // --- before or without a server ---

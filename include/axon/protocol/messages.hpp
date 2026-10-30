@@ -46,13 +46,16 @@ struct FileEntry {
 };
 
 // C->S, first message of a download. session_id 0 asks for a new session.
-// A Get from another protocol version decodes to just its version, so the
-// server can still answer Err{BadVersion}.
+// `connections`: how many connections the client shares the download over
+// (at least 1); fault injection spreads its cuts accordingly. A Get from
+// another protocol version decodes to just its version, so the server can
+// still answer Err{BadVersion}.
 struct Get {
     static constexpr MsgType type = MsgType::Get;
     std::uint16_t version = protocol_version;
     std::string topic{};
     std::uint64_t session_id = 0;
+    std::uint16_t connections = 1;
     bool want_list = false;
     bool operator==(const Get&) const = default;
 };

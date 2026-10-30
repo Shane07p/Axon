@@ -187,7 +187,9 @@ void Server::serve_client(Socket& sock, std::uint64_t conn_id, const std::string
     session->connected();
     ok.session_id = session->id();
     send_message(sock, ok);
-    FaultPlan fault{config_.fault, conn_id, session->bytes_left()};
+    // Like the C version: each of the client's connections carries about 1/n of
+    // what is left, so the cut point is drawn over that share.
+    FaultPlan fault{config_.fault, conn_id, session->bytes_left() / get->connections};
 
     std::vector<std::byte> buf(max_data_len);
     while (const auto msg = reader.read(sock)) {

@@ -32,7 +32,7 @@ namespace {
 constexpr std::string_view usage =
     "usage: axon serve --root DIR [--port PORT] [--bind ADDRESS]\n"
     "                  [--fail-prob P [--seed N]]   cut connections on purpose, for testing\n"
-    "       axon fetch HOST[:PORT] TOPIC [--output DIR]\n"
+    "       axon fetch HOST[:PORT] TOPIC [--output DIR] [--connections N]\n"
     "       axon list HOST[:PORT]\n"
     "       axon --version\n";
 
@@ -79,6 +79,15 @@ std::uint64_t parse_seed(std::string_view s) {
         throw UsageError(std::format("--seed needs a whole number, not '{}'", s));
     }
     return seed;
+}
+
+std::size_t parse_connections(std::string_view s) {
+    unsigned n = 0;
+    const auto [end, ec] = std::from_chars(s.data(), s.data() + s.size(), n);
+    if (ec != std::errc{} || end != s.data() + s.size() || n < 1 || n > 64) {
+        throw UsageError(std::format("--connections needs a number from 1 to 64, not '{}'", s));
+    }
+    return n;
 }
 
 std::uint64_t random_seed() {
@@ -181,14 +190,17 @@ int fetch(std::span<char* const> args) {
     }
     const axon::Endpoint server = axon::parse_endpoint(args[0], default_port);
     const std::string topic{args[1]};
-    const Options opts = parse_options(args.subspan(2), {"--output"});
+    const Options opts = parse_options(args.subspan(2), {"--output", "--connections"});
     const std::filesystem::path output{opts.contains("--output") ? opts.at("--output") : "."};
+    const std::size_t connections =
+        opts.contains("--connections") ? parse_connections(opts.at("--connections")) : 1;
 
     const axon::FetchStats stats = axon::fetch(
         {.host = server.host,
          .port = server.port,
          .topic = topic,
          .output = output,
+         .connections = connections,
          .on_retry = [](const std::string& reason, std::chrono::milliseconds wait) {
              std::cerr << std::format("axon: {}; reconnecting in {} ms\n", reason, wait.count());
          }});

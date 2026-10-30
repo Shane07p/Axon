@@ -51,6 +51,7 @@ void put(ByteWriter& w, const Get& m) {
     w.put_u16(m.version);
     w.put_str(m.topic);
     w.put_u64(m.session_id);
+    w.put_u16(m.connections);
     w.put_u8(static_cast<std::uint8_t>(m.want_list));
 }
 
@@ -114,6 +115,10 @@ Get decode_get(ByteReader& r) {
         malformed("GET: invalid topic name");
     }
     m.session_id = r.get_u64();
+    m.connections = r.get_u16();
+    if (m.connections == 0) {
+        malformed("GET: connections must be at least 1");
+    }
     m.want_list = get_bool(r, "GET want_list");
     return m;
 }

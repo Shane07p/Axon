@@ -93,6 +93,12 @@ for topic in mixed bulk empty; do
     expect_rc 0 "$AXON" fetch "$SERVER" "$topic" --output "$OUT"
     diff -r "$DATA/$topic" "$OUT/$topic" > /dev/null || fail "fetch $topic: files differ"
 done
+for n in 2 4 8; do
+    expect_rc 0 "$AXON" fetch "$SERVER" mixed --output "$WORK/out-$n" --connections "$n"
+    diff -r "$DATA/mixed" "$WORK/out-$n/mixed" > /dev/null || fail "fetch with $n connections: files differ"
+done
+expect_rc 2 "$AXON" fetch "$SERVER" mixed --connections 0
+expect_rc 2 "$AXON" fetch "$SERVER" mixed --connections 65
 expect_rc 0 "$AXON" fetch "$SERVER" linked --output "$OUT"
 [[ $(ls -A "$OUT/linked") == real.txt ]] || fail "linked: expected only real.txt, got $(ls -A "$OUT/linked")"
 [[ -z $(find "$OUT" -name '.axon-*') ]] || fail "temporary files left behind"
@@ -130,12 +136,14 @@ for topic in mixed bulk; do
     expect_rc 0 "$AXON" fetch "$SERVER" "$topic" --output "$OUT"
     diff -r "$DATA/$topic" "$OUT/$topic" > /dev/null || fail "faulty fetch $topic: files differ"
 done
-[[ -z $(find "$OUT" -name '.axon-*') ]] || fail "temporary files left behind after faults"
+expect_rc 0 "$AXON" fetch "$SERVER" mixed --output "$WORK/out-faulty-4" --connections 4
+diff -r "$DATA/mixed" "$WORK/out-faulty-4/mixed" > /dev/null || fail "faulty fetch with 4 connections: files differ"
+[[ -z $(find "$OUT" "$WORK/out-faulty-4" -name '.axon-*') ]] || fail "temporary files left behind after faults"
 cuts=$(grep -c "fault injection cut the connection" "$WORK/server.log" || true)
 [[ $cuts -ge 3 ]] || fail "expected several injected cuts, saw $cuts"
 # Every byte that got through a cut was kept, so no session was sent anything twice.
 sessions=$(grep -c "session .* done:" "$WORK/server.log" || true)
-[[ $sessions == 2 ]] || fail "expected 2 finished sessions, saw $sessions"
+[[ $sessions == 3 ]] || fail "expected 3 finished sessions, saw $sessions"
 if grep "session .* done:" "$WORK/server.log" | grep -qv ", 0 resent,"; then
     fail "a session was sent bytes twice: $(grep 'session .* done:' "$WORK/server.log")"
 fi

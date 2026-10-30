@@ -261,6 +261,23 @@ TEST_F(ServerTest, FaultInjectionCutsInsideADataFrame) {
     EXPECT_LT(d.bytes.size(), big.size() + 4);
 }
 
+TEST_F(ServerTest, CutPointIsDrawnOverOneConnectionsShare) {
+    // Like the C version: with 4 connections each carries about a quarter, so
+    // the cut lands in the first quarter of what is left.
+    start({.idle_timeout = 5s, .fault = {.probability = 1, .seed = 7}});
+    const std::uint64_t total = big.size() + 4;
+    for (int attempt = 0; attempt < 5; ++attempt) {
+        auto sock = connect();
+        MessageReader reader;
+        (void)ask(sock, reader, Get{.topic = "animals", .connections = 4});
+        send_message(sock, Req{{{.file_id = 0, .offset = 0, .length = big.size()},
+                                {.file_id = 1, .offset = 0, .length = 4}}});
+        const Delivery d = receive_until_cut(sock, reader, total);
+        EXPECT_TRUE(d.cut_mid_frame);
+        EXPECT_LE(d.bytes.size(), total / 4);
+    }
+}
+
 TEST_F(ServerTest, ListIsNeverCut) {
     start({.idle_timeout = 5s, .fault = {.probability = 1, .seed = 7}});
     auto sock = connect();

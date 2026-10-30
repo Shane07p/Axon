@@ -47,9 +47,11 @@ struct FetchRequest {
     std::uint16_t port = 0;
     std::string topic{};
     std::filesystem::path output{};  // files land in output/topic/
+    std::size_t connections = 1;     // parallel connections sharing the download
     std::chrono::milliseconds timeout{std::chrono::seconds{30}};  // per send or receive
-    RetryPolicy retry{};
-    // Called before each reconnect with the reason and the wait.
+    RetryPolicy retry{};  // per connection
+    // Called before each reconnect with the reason and the wait. With several
+    // connections it may be called from several threads at once.
     std::function<void(const std::string& reason, std::chrono::milliseconds wait)> on_retry{};
 };
 
@@ -65,10 +67,15 @@ struct FetchStats {
 // CRC-32, then renamed into place: a file under its real name is always
 // complete. Other files in the folder are left alone.
 //
-// A connection lost part-way is resumed: fetch() reconnects with backoff,
-// rejoins its session and asks for every unfinished file from the exact byte
-// it has. If the server no longer knows the session, it starts over. The very
-// first connect is not retried, so a wrong address fails at once.
+// With connections > 1, that many connections share one session and take
+// files from a common queue, a batch at a time.
+//
+// A connection lost part-way is resumed: its unfinished files go back to the
+// front of the queue (another connection may take them at once), and it
+// reconnects with backoff and rejoins the session. Every file continues from
+// the exact byte it has. If the server no longer knows the session, the
+// download starts over. The very first connect is not retried, so a wrong
+// address fails at once.
 //
 // Throws std::invalid_argument for an invalid topic name, ServerError,
 // ProtocolError, IntegrityError, std::system_error for disk errors, and

@@ -45,9 +45,13 @@ const std::vector<FileEntry> two_files{{"a.txt", 10, 0xAAAAAAAA}, {"b.bin", 0, 0
 // --- round trips and layout ---
 
 TEST(Messages, GetRoundTrips) {
-    const Get m{.topic = "animals", .session_id = 42, .want_list = true};
+    const Get m{.topic = "animals", .session_id = 42, .connections = 8, .want_list = true};
     EXPECT_EQ(round_trip(m), m);
     EXPECT_EQ(round_trip(Get{.topic = "t"}), Get{.topic = "t"});
+}
+
+TEST(Messages, GetNeedsAtLeastOneConnection) {
+    expect_rejected(Get{.topic = "t", .connections = 0});
 }
 
 TEST(Messages, OkRoundTripsWithAndWithoutList) {
@@ -116,10 +120,12 @@ TEST(Messages, AckHasEmptyPayload) {
 }
 
 TEST(Messages, GetWireLayout) {
-    const auto payload = encode(Get{.topic = "ab", .session_id = 0x0102030405060708, .want_list = true});
+    const auto payload = encode(
+        Get{.topic = "ab", .session_id = 0x0102030405060708, .connections = 4, .want_list = true});
     EXPECT_EQ(payload, bytes_of({0x00, 0x01,                                      // version
                                  0x00, 0x02, 'a', 'b',                            // topic
                                  0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,  // session
+                                 0x00, 0x04,                                      // connections
                                  0x01}));                                         // want_list
 }
 
@@ -189,6 +195,7 @@ TEST(Messages, GetRejectsBadTopicsAndFlags) {
     w.put_u16(protocol_version);
     w.put_str("ok");
     w.put_u64(0);
+    w.put_u16(1);
     w.put_u8(2);  // want_list must be 0 or 1
     EXPECT_THROW((void)decode(tag_of(Get{}), w.view()), DecodeError);
 }
