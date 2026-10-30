@@ -18,8 +18,10 @@ File::File(Fd fd, std::filesystem::path path) noexcept
 
 File File::open(const std::filesystem::path& path, int flags) {
     // O_NONBLOCK stops a FIFO with no writer from blocking open(). It has no
-    // effect on regular files, the only kind accepted below.
-    Fd fd{::open(path.c_str(), flags | O_CLOEXEC | O_NONBLOCK, 0644)};
+    // effect on regular files, the only kind accepted below. O_NOFOLLOW
+    // refuses a symlink as the last path component (ELOOP), so a link planted
+    // in a dataset or output folder cannot redirect reads or writes.
+    Fd fd{::open(path.c_str(), flags | O_CLOEXEC | O_NONBLOCK | O_NOFOLLOW, 0644)};
     if (!fd) {
         detail::throw_errno("open", path.native());
     }

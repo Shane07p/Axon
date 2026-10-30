@@ -1,8 +1,8 @@
 #include <sys/stat.h>
 
 #include <array>
+#include <cerrno>
 #include <cstddef>
-#include <cstdlib>
 #include <filesystem>
 #include <span>
 #include <string>
@@ -19,25 +19,7 @@ namespace {
 namespace fs = std::filesystem;
 using axon::File;
 
-// Each test gets its own empty temporary directory.
-class FileTest : public axon::test::NoFdLeak {
-protected:
-    void SetUp() override {
-        NoFdLeak::SetUp();
-        std::string tmpl = (fs::temp_directory_path() / "axon-test-XXXXXX").string();
-        ASSERT_NE(::mkdtemp(tmpl.data()), nullptr);
-        dir_ = tmpl;
-    }
-    void TearDown() override {
-        if (!dir_.empty()) {
-            std::error_code ec;
-            fs::remove_all(dir_, ec);
-        }
-        NoFdLeak::TearDown();
-    }
-
-    fs::path dir_;
-};
+class FileTest : public axon::test::TempDirTest {};
 
 std::span<const std::byte> bytes(std::string_view s) {
     return std::as_bytes(std::span{s.data(), s.size()});
@@ -102,6 +84,22 @@ TEST_F(FileTest, RejectsFifoWithoutBlocking) {
     // No writer exists: a blocking open would hang here until the test times out.
     EXPECT_THROW((void)File::open_read(fifo), std::system_error);
     EXPECT_THROW((void)File::open_write(fifo), std::system_error);
+}
+
+TEST_F(FileTest, RefusesToFollowSymlinks) {
+    const auto target = dir_ / "real.txt";
+    const auto link = dir_ / "link.txt";
+    File::open_write(target).write_at(bytes("secret"), 0);
+    fs::create_symlink(target, link);
+    for (const bool write : {false, true}) {
+        try {
+            (void)(write ? File::open_write(link) : File::open_read(link));
+            FAIL() << "followed a symlink, write=" << write;
+        } catch (const std::system_error& e) {
+            EXPECT_EQ(e.code().value(), ELOOP) << e.what();
+        }
+    }
+    EXPECT_EQ(read_all(File::open_read(target)), "secret");  // target untouched
 }
 
 TEST_F(FileTest, RejectsDevices) {
