@@ -37,6 +37,7 @@ add_library(axon_core
     src/fd.cpp
     src/net/socket.cpp
     src/protocol/bytes.cpp
+    src/protocol/messages.cpp
     src/storage/file.cpp
     src/version.cpp)
 target_include_directories(axon_core PUBLIC include PRIVATE src)

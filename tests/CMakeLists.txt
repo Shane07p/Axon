@@ -14,6 +14,7 @@ add_executable(axon_unit_tests
     unit/bytes_test.cpp
     unit/fd_test.cpp
     unit/file_test.cpp
+    unit/messages_test.cpp
     unit/socket_test.cpp
     unit/version_test.cpp)
 target_link_libraries(axon_unit_tests PRIVATE axon_core GTest::gtest_main)
