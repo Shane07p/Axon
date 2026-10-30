@@ -1,6 +1,9 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
+#include <span>
+#include <stdexcept>
 #include <string>
 #include <utility>
 
@@ -8,7 +11,14 @@
 
 namespace axon {
 
+// The peer closed the connection in the middle of something we were reading.
+class ConnectionClosed : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+
 // A connected stream socket. Closes itself when destroyed; move-only.
+// I/O errors (reset, timeout, writing to a closed peer) throw std::system_error.
 class Socket {
 public:
     Socket() noexcept = default;
@@ -21,6 +31,14 @@ public:
 
     // Two sockets connected to each other, for tests.
     [[nodiscard]] static std::pair<Socket, Socket> pair();
+
+    // Sends all of `head` then all of `body`, in one system call when the
+    // kernel takes it all. A closed peer gives EPIPE, never SIGPIPE.
+    void send_all(std::span<const std::byte> head, std::span<const std::byte> body = {});
+
+    // Fills `buf` completely. Returns false if the peer closed before sending
+    // a single byte; throws ConnectionClosed if it closed part-way through.
+    [[nodiscard]] bool recv_all(std::span<std::byte> buf);
 
     [[nodiscard]] int fd() const noexcept { return fd_.get(); }
     explicit operator bool() const noexcept { return static_cast<bool>(fd_); }

@@ -11,6 +11,7 @@
 #include <stdexcept>
 #include <system_error>
 
+#include "net/iov.hpp"
 #include "sys_error.hpp"
 
 namespace axon {
@@ -45,6 +46,47 @@ std::pair<Socket, Socket> Socket::pair() {
         detail::throw_errno("socketpair");
     }
     return {Socket{Fd{fds[0]}}, Socket{Fd{fds[1]}}};
+}
+
+void Socket::send_all(std::span<const std::byte> head, std::span<const std::byte> body) {
+    // sendmsg never writes through iov_base, so dropping const is safe.
+    std::array<iovec, 2> iov{
+        iovec{const_cast<std::byte*>(head.data()), head.size()},
+        iovec{const_cast<std::byte*>(body.data()), body.size()},
+    };
+    std::size_t first = detail::skip_written(iov, 0, 0);  // first iovec with bytes left
+    while (first < iov.size()) {
+        msghdr msg{};
+        msg.msg_iov = &iov[first];
+        msg.msg_iovlen = iov.size() - first;
+        const ssize_t n = ::sendmsg(fd(), &msg, MSG_NOSIGNAL);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            detail::throw_errno("send");
+        }
+        first = detail::skip_written(iov, first, static_cast<std::size_t>(n));
+    }
+}
+
+bool Socket::recv_all(std::span<std::byte> buf) {
+    std::size_t done = 0;
+    while (done < buf.size()) {
+        const ssize_t n = ::recv(fd(), buf.data() + done, buf.size() - done, 0);
+        if (n > 0) {
+            done += static_cast<std::size_t>(n);
+        } else if (n == 0) {
+            if (done == 0) {
+                return false;
+            }
+            throw ConnectionClosed("connection closed after " + std::to_string(done) + " of " +
+                                   std::to_string(buf.size()) + " bytes");
+        } else if (errno != EINTR) {
+            detail::throw_errno("recv");
+        }
+    }
+    return true;
 }
 
 Listener Listener::listen(const std::string& address, std::uint16_t port) {

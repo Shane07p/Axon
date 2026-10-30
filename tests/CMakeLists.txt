@@ -14,9 +14,13 @@ add_executable(axon_unit_tests
     unit/bytes_test.cpp
     unit/fd_test.cpp
     unit/file_test.cpp
+    unit/frame_test.cpp
+    unit/iov_test.cpp
     unit/messages_test.cpp
     unit/socket_test.cpp
     unit/version_test.cpp)
 target_link_libraries(axon_unit_tests PRIVATE axon_core GTest::gtest_main)
+# White-box tests of internal helpers include private headers from src/.
+target_include_directories(axon_unit_tests PRIVATE ${PROJECT_SOURCE_DIR}/src)
 # A hang (blocked I/O, endless loop) fails the test instead of stalling the run.
 gtest_discover_tests(axon_unit_tests PROPERTIES TIMEOUT 30)

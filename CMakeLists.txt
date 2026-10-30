@@ -37,6 +37,7 @@ add_library(axon_core
     src/fd.cpp
     src/net/socket.cpp
     src/protocol/bytes.cpp
+    src/protocol/frame.cpp
     src/protocol/messages.cpp
     src/storage/file.cpp
     src/version.cpp)
