@@ -34,8 +34,11 @@ endif()
 
 # Core library: everything except the CLI lives here so tests can link it.
 add_library(axon_core
+    src/fd.cpp
+    src/net/socket.cpp
+    src/storage/file.cpp
     src/version.cpp)
-target_include_directories(axon_core PUBLIC include)
+target_include_directories(axon_core PUBLIC include PRIVATE src)
 target_compile_definitions(axon_core PRIVATE AXON_VERSION="${PROJECT_VERSION}")
 target_link_libraries(axon_core PUBLIC axon_options)
 
