@@ -50,17 +50,34 @@ head -c 20000000 /dev/urandom > "$DATA/bulk/20MB.bin"
 echo real > "$DATA/linked/real.txt"
 ln -s /etc/passwd "$DATA/linked/passwd"  # must not be served
 
+# start_server [EXTRA ARGS...]: starts `axon serve` on a free port and sets
+# SERVER_PID, PORT and SERVER.
+start_server() {
+    : > "$WORK/server.log"
+    "$AXON" serve --root "$DATA" --port 0 --bind 127.0.0.1 "$@" 2> "$WORK/server.log" &
+    SERVER_PID=$!
+    for _ in $(seq 100); do
+        grep -q "serving" "$WORK/server.log" && break
+        kill -0 "$SERVER_PID" 2> /dev/null || fail "server exited during startup"
+        sleep 0.1
+    done
+    PORT=$(grep -o '127\.0\.0\.1:[0-9]*' "$WORK/server.log" | head -1 | cut -d: -f2)
+    [[ -n $PORT ]] || fail "server never reported its port"
+    SERVER=127.0.0.1:$PORT
+}
+
+# stop_server: Ctrl+C, and the server must exit 0.
+stop_server() {
+    local rc=0
+    kill -INT "$SERVER_PID"
+    wait "$SERVER_PID" || rc=$?
+    SERVER_PID=
+    [[ $rc == 0 ]] || fail "server exited with $rc after SIGINT"
+    grep -q "stopped" "$WORK/server.log" || fail "server did not log a clean stop"
+}
+
 # --- start the server ---
-"$AXON" serve --root "$DATA" --port 0 --bind 127.0.0.1 2> "$WORK/server.log" &
-SERVER_PID=$!
-for _ in $(seq 100); do
-    grep -q "serving" "$WORK/server.log" && break
-    kill -0 "$SERVER_PID" 2> /dev/null || fail "server exited during startup"
-    sleep 0.1
-done
-PORT=$(grep -o '127\.0\.0\.1:[0-9]*' "$WORK/server.log" | head -1 | cut -d: -f2)
-[[ -n $PORT ]] || fail "server never reported its port"
-SERVER=127.0.0.1:$PORT
+start_server
 grep -q "skipped linked/passwd: symlinks are not followed" "$WORK/server.log" ||
     fail "symlink was not reported as skipped"
 
@@ -101,12 +118,21 @@ expect_rc 1 "$AXON" serve --root "$DATA" --port "$PORT" --bind 127.0.0.1  # port
 
 # --- Ctrl+C stops the server cleanly ---
 exec 3<> "/dev/tcp/127.0.0.1/$PORT"  # an idle client still connected
-kill -INT "$SERVER_PID"
-rc=0
-wait "$SERVER_PID" || rc=$?
-SERVER_PID=
+stop_server
 exec 3>&-
-[[ $rc == 0 ]] || fail "server exited with $rc after SIGINT"
-grep -q "stopped" "$WORK/server.log" || fail "server did not log a clean stop"
 
-echo "PASS"
+# --- the same downloads through a server that cuts 70% of connections ---
+start_server --fail-prob 0.7 --seed 1
+grep -q "fault injection: each connection is cut with probability 0.7" "$WORK/server.log" ||
+    fail "fault injection not announced"
+OUT=$WORK/out-faulty
+for topic in mixed bulk; do
+    expect_rc 0 "$AXON" fetch "$SERVER" "$topic" --output "$OUT"
+    diff -r "$DATA/$topic" "$OUT/$topic" > /dev/null || fail "faulty fetch $topic: files differ"
+done
+[[ -z $(find "$OUT" -name '.axon-*') ]] || fail "temporary files left behind after faults"
+cuts=$(grep -c "fault injection cut the connection" "$WORK/server.log" || true)
+[[ $cuts -ge 3 ]] || fail "expected several injected cuts, saw $cuts"
+stop_server
+
+echo "PASS ($cuts injected cuts survived)"

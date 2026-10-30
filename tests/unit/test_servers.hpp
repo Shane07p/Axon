@@ -41,19 +41,25 @@ private:
     std::jthread thread_;
 };
 
-// Accepts one connection and runs `script` on it, on its own thread: a server
-// that misbehaves on purpose.
+// Accepts `connections` connections one after another and runs `script` on
+// each (with its index, from 0), on its own thread: a server that misbehaves
+// on purpose.
 class FakeServer {
 public:
-    explicit FakeServer(std::function<void(Socket&)> script)
+    explicit FakeServer(std::function<void(Socket&, int)> script, int connections)
         : listener_{Listener::listen("127.0.0.1", 0)},
-          thread_{[this, script = std::move(script)] {
-              try {
-                  Socket sock = listener_.accept();
-                  script(sock);
-              } catch (const std::exception&) {  // the client hung up first
+          thread_{[this, script = std::move(script), connections] {
+              for (int i = 0; i < connections; ++i) {
+                  try {
+                      Socket sock = listener_.accept();
+                      script(sock, i);
+                  } catch (const std::exception&) {  // the client hung up first
+                  }
               }
           }} {}
+
+    explicit FakeServer(std::function<void(Socket&)> script)
+        : FakeServer([s = std::move(script)](Socket& sock, int) { s(sock); }, 1) {}
     FakeServer(const FakeServer&) = delete;
     FakeServer& operator=(const FakeServer&) = delete;
 

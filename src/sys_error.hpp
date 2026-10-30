@@ -7,17 +7,18 @@
 
 namespace axon::detail {
 
-// Throws std::system_error for the current errno, e.g.
+// Throws E (a std::system_error) for the current errno, e.g.
 // "open data/a.txt: No such file or directory". Takes views so nothing
 // allocates (and possibly changes errno) before errno is read.
-[[noreturn]] inline void throw_errno(std::string_view op, std::string_view subject = {}) {
+template <typename E = std::system_error>
+[[noreturn]] void throw_errno(std::string_view op, std::string_view subject = {}) {
     const int err = errno;
     std::string what{op};
     if (!subject.empty()) {
         what += ' ';
         what += subject;
     }
-    throw std::system_error(err, std::generic_category(), what);
+    throw E(err, std::generic_category(), what);
 }
 
 }  // namespace axon::detail

@@ -40,14 +40,15 @@ public:
     Server(const Server&) = delete;
     Server& operator=(const Server&) = delete;
 
-    // Accepts and serves clients until stop(), then closes every connection
-    // and joins its thread before returning.
+    // Accepts and serves clients until stop(). Then closes the listening
+    // socket (clients still waiting to be accepted get a reset), closes every
+    // connection and joins its thread before returning.
     void run();
 
     // Makes run() return. Async-signal-safe, so a signal handler may call it.
     void stop() noexcept;
 
-    [[nodiscard]] std::uint16_t port() const { return listener_.local_port(); }
+    [[nodiscard]] std::uint16_t port() const noexcept { return port_; }
     [[nodiscard]] ServerStats stats() const;
 
 private:
@@ -67,6 +68,7 @@ private:
 
     Dataset dataset_;
     Listener listener_;
+    std::uint16_t port_;
     ServerConfig config_;
     SessionTable sessions_;  // after dataset_: sessions point into it
     std::atomic<std::uint64_t> sessions_finished_{0};

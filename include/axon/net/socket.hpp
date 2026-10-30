@@ -19,9 +19,16 @@ public:
     using std::runtime_error::runtime_error;
 };
 
+// A socket operation failed: refused, reset, timed out, or the peer is gone.
+// A std::system_error, told apart from disk errors so callers can retry it.
+class NetworkError : public std::system_error {
+public:
+    using std::system_error::system_error;
+};
+
 // A connected stream socket. Closes itself when destroyed; move-only.
 // I/O errors (reset, writing to a closed peer, a timeout from set_timeouts,
-// reported as ETIMEDOUT) throw std::system_error.
+// reported as ETIMEDOUT) throw NetworkError.
 class Socket {
 public:
     Socket() noexcept = default;
@@ -42,6 +49,10 @@ public:
     // Fills `buf` completely. Returns false if the peer closed before sending
     // a single byte; throws ConnectionClosed if it closed part-way through.
     [[nodiscard]] bool recv_all(std::span<std::byte> buf);
+
+    // Receives whatever is available, at least one byte, into `buf`. Returns
+    // the count, or 0 if the peer closed the connection.
+    [[nodiscard]] std::size_t recv_some(std::span<std::byte> buf);
 
     // Makes any single send or receive that waits longer than `t` fail with
     // ETIMEDOUT, so a silent or stalled peer cannot block a thread forever.

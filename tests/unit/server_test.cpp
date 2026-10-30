@@ -420,10 +420,27 @@ TEST_F(ServerTest, StopClosesConnectedClientsPromptly) {
     server_->stop();  // returns once run() has joined every connection thread
     EXPECT_LT(std::chrono::steady_clock::now() - t0, 2s);
 
-    MessageReader r2;
-    EXPECT_FALSE(r2.read(idle).has_value());
+    // `idle` may not have been accepted yet when stop() came (the kernel can
+    // queue the two handshakes in either order): then the closed listener
+    // resets it. Either way it must end, not hang.
+    const auto ended = [](Socket& sock) {
+        try {
+            MessageReader r;
+            return !r.read(sock).has_value();
+        } catch (const axon::NetworkError&) {
+            return true;
+        }
+    };
+    EXPECT_TRUE(ended(idle));
     EXPECT_FALSE(reader.read(mid).has_value());
     server_.reset();
+}
+
+TEST_F(ServerTest, ClientsStillQueuedAtStopAreRefusedNotLeftHanging) {
+    start();
+    server_->stop();
+    // The server is still alive but stopped: connecting must fail, not queue.
+    EXPECT_THROW((void)connect(), axon::NetworkError);
 }
 
 TEST_F(ServerTest, DropsClientThatStaysSilent) {

@@ -39,13 +39,13 @@ Socket Socket::connect(const std::string& host, std::uint16_t port) {
         }
         err = errno;  // read before fd's destructor runs close()
     }
-    throw std::system_error(err, std::generic_category(), "connect " + where);
+    throw NetworkError(err, std::generic_category(), "connect " + where);
 }
 
 std::pair<Socket, Socket> Socket::pair() {
     std::array<int, 2> fds{};
     if (::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, fds.data()) != 0) {
-        detail::throw_errno("socketpair");
+        detail::throw_errno<NetworkError>("socketpair");
     }
     return {Socket{Fd{fds[0]}}, Socket{Fd{fds[1]}}};
 }
@@ -69,7 +69,7 @@ void Socket::send_all(std::span<const std::byte> head, std::span<const std::byte
             if (errno == EAGAIN) {
                 errno = ETIMEDOUT;  // only a send timeout makes a blocking socket say EAGAIN
             }
-            detail::throw_errno("send");
+            detail::throw_errno<NetworkError>("send");
         }
         first = detail::skip_written(iov, first, static_cast<std::size_t>(n));
     }
@@ -91,10 +91,25 @@ bool Socket::recv_all(std::span<std::byte> buf) {
             if (errno == EAGAIN) {
                 errno = ETIMEDOUT;  // only a receive timeout makes a blocking socket say EAGAIN
             }
-            detail::throw_errno("recv");
+            detail::throw_errno<NetworkError>("recv");
         }
     }
     return true;
+}
+
+std::size_t Socket::recv_some(std::span<std::byte> buf) {
+    for (;;) {
+        const ssize_t n = ::recv(fd(), buf.data(), buf.size(), 0);
+        if (n >= 0) {
+            return static_cast<std::size_t>(n);
+        }
+        if (errno != EINTR) {
+            if (errno == EAGAIN) {
+                errno = ETIMEDOUT;  // only a receive timeout makes a blocking socket say EAGAIN
+            }
+            detail::throw_errno<NetworkError>("recv");
+        }
+    }
 }
 
 void Socket::set_timeouts(std::chrono::milliseconds t) {
@@ -103,7 +118,7 @@ void Socket::set_timeouts(std::chrono::milliseconds t) {
                      .tv_usec = static_cast<suseconds_t>(us % 1'000'000)};
     if (::setsockopt(fd(), SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv) != 0 ||
         ::setsockopt(fd(), SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv) != 0) {
-        detail::throw_errno("setsockopt timeout");
+        detail::throw_errno<NetworkError>("setsockopt timeout");
     }
 }
 
@@ -121,18 +136,18 @@ Listener Listener::listen(const std::string& address, std::uint16_t port) {
 
     Fd fd{::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0)};
     if (!fd) {
-        detail::throw_errno("socket");
+        detail::throw_errno<NetworkError>("socket");
     }
     // Lets a restarted server bind its port again right away.
     const int one = 1;
     if (::setsockopt(fd.get(), SOL_SOCKET, SO_REUSEADDR, &one, sizeof one) != 0) {
-        detail::throw_errno("setsockopt SO_REUSEADDR");
+        detail::throw_errno<NetworkError>("setsockopt SO_REUSEADDR");
     }
     if (::bind(fd.get(), reinterpret_cast<const sockaddr*>(&addr), sizeof addr) != 0) {
-        detail::throw_errno("bind", where);
+        detail::throw_errno<NetworkError>("bind", where);
     }
     if (::listen(fd.get(), SOMAXCONN) != 0) {
-        detail::throw_errno("listen", where);
+        detail::throw_errno<NetworkError>("listen", where);
     }
     return Listener{std::move(fd)};
 }
@@ -144,7 +159,7 @@ Socket Listener::accept() const {
         }
         pollfd p{.fd = fd_.get(), .events = POLLIN, .revents = 0};
         if (::poll(&p, 1, -1) < 0 && errno != EINTR) {
-            detail::throw_errno("poll");
+            detail::throw_errno<NetworkError>("poll");
         }
     }
 }
@@ -159,14 +174,14 @@ std::optional<Socket> Listener::try_accept() const {
     if (errno == EAGAIN || errno == EINTR || errno == ECONNABORTED) {
         return std::nullopt;
     }
-    detail::throw_errno("accept");
+    detail::throw_errno<NetworkError>("accept");
 }
 
 std::uint16_t Listener::local_port() const {
     sockaddr_in addr{};
     socklen_t len = sizeof addr;
     if (::getsockname(fd_.get(), reinterpret_cast<sockaddr*>(&addr), &len) != 0) {
-        detail::throw_errno("getsockname");
+        detail::throw_errno<NetworkError>("getsockname");
     }
     return ntohs(addr.sin_port);
 }

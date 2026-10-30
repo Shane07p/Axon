@@ -31,22 +31,33 @@ void send_truncated(Socket& sock, const Message& msg, std::size_t payload_bytes)
                   std::span{payload}.first(std::min(payload_bytes, payload.size())));
 }
 
-std::optional<Message> MessageReader::read(Socket& sock) {
+std::optional<FrameHeader> read_frame_header(Socket& sock) {
     std::array<std::byte, frame_header_len> header{};
     if (!sock.recv_all(header)) {
         return std::nullopt;
     }
-    const auto tag = load_be<std::uint32_t>(std::span{header}.first<4>());
-    const auto len = load_be<std::uint32_t>(std::span{header}.last<4>());
-    if (len > max_payload_) {
-        throw DecodeError("frame too large: " + std::to_string(len) + " bytes, limit " +
+    return FrameHeader{.type = load_be<std::uint32_t>(std::span{header}.first<4>()),
+                       .length = load_be<std::uint32_t>(std::span{header}.last<4>())};
+}
+
+std::optional<Message> MessageReader::read(Socket& sock) {
+    const auto header = read_frame_header(sock);
+    if (!header) {
+        return std::nullopt;
+    }
+    return read_payload(sock, *header);
+}
+
+Message MessageReader::read_payload(Socket& sock, const FrameHeader& header) {
+    if (header.length > max_payload_) {
+        throw DecodeError("frame too large: " + std::to_string(header.length) + " bytes, limit " +
                           std::to_string(max_payload_));
     }
-    buf_.resize(len);
+    buf_.resize(header.length);
     if (!sock.recv_all(buf_)) {
         throw ConnectionClosed("connection closed between frame header and payload");
     }
-    return decode(tag, buf_);
+    return decode(header.type, buf_);
 }
 
 }  // namespace axon::proto

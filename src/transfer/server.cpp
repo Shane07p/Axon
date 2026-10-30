@@ -122,6 +122,7 @@ Topics summarize(const Dataset& dataset) {
 Server::Server(Dataset dataset, Listener listener, ServerConfig config)
     : dataset_{std::move(dataset)},
       listener_{std::move(listener)},
+      port_{listener_.local_port()},
       config_{config},
       sessions_{config.session_ttl},
       wake_{::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK)} {
@@ -257,6 +258,7 @@ void Server::run() {
             std::ranges::count_if(conns_, [](const Conn& c) { return !c.done.load(); }));
     }
     log_msg("stopping: closing {} connection(s)", open);
+    listener_ = Listener{};  // clients still in the accept queue get a reset, not a hang
     close_all();
 }
 

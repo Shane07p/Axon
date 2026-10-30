@@ -124,4 +124,17 @@ TEST_F(FrameTest, MessageLargerThanSocketBufferArrivesIntact) {
     EXPECT_EQ(std::get<Ok>(reader.read(b).value()), big);
 }
 
+TEST_F(FrameTest, HeaderAndPayloadCanBeReadSeparately) {
+    auto [a, b] = Socket::pair();
+    send_message(a, Err{.code = ErrCode::Internal, .reason = "x"});
+    a = Socket{};
+    const auto header = read_frame_header(b);
+    ASSERT_TRUE(header.has_value());
+    EXPECT_EQ(header->type, tag("ERR "));
+    EXPECT_EQ(header->length, 5u);  // code (2) + reason (2 + 1)
+    MessageReader reader;
+    EXPECT_EQ(std::get<Err>(reader.read_payload(b, *header)).reason, "x");
+    EXPECT_FALSE(read_frame_header(b).has_value());  // clean close
+}
+
 }  // namespace

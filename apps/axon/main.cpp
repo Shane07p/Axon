@@ -184,13 +184,21 @@ int fetch(std::span<char* const> args) {
     const Options opts = parse_options(args.subspan(2), {"--output"});
     const std::filesystem::path output{opts.contains("--output") ? opts.at("--output") : "."};
 
-    const axon::FetchStats stats =
-        axon::fetch({.host = server.host, .port = server.port, .topic = topic, .output = output});
+    const axon::FetchStats stats = axon::fetch(
+        {.host = server.host,
+         .port = server.port,
+         .topic = topic,
+         .output = output,
+         .on_retry = [](const std::string& reason, std::chrono::milliseconds wait) {
+             std::cerr << std::format("axon: {}; reconnecting in {} ms\n", reason, wait.count());
+         }});
     const double secs = stats.elapsed.count();
-    std::cout << std::format("fetched {}: {} file(s), {} in {:.2f} s ({:.1f} MB/s) into {}\n", topic,
-                             stats.files, human_bytes(stats.bytes), secs,
+    const std::size_t reconnects = stats.connections - 1;
+    std::cout << std::format("fetched {}: {} file(s), {} in {:.2f} s ({:.1f} MB/s) into {}{}\n",
+                             topic, stats.files, human_bytes(stats.bytes), secs,
                              static_cast<double>(stats.bytes) / 1e6 / std::max(secs, 1e-9),
-                             (output / topic).string());
+                             (output / topic).string(),
+                             reconnects > 0 ? std::format(", {} reconnect(s)", reconnects) : "");
     return 0;
 }
 

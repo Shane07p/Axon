@@ -177,4 +177,14 @@ TEST_F(SocketTest, TryAcceptDoesNotWaitWhenNobodyConnects) {
     EXPECT_TRUE(server.has_value());
 }
 
+TEST_F(SocketTest, RecvSomeReturnsWhatHasArrivedAndZeroOnClose) {
+    auto [a, b] = Socket::pair();
+    a.send_all(bytes("abc"));
+    std::array<std::byte, 16> buf{};
+    const std::size_t n = b.recv_some(buf);
+    EXPECT_EQ(text(std::span{buf}.first(n)), "abc");
+    a = Socket{};
+    EXPECT_EQ(b.recv_some(buf), 0u);
+}
+
 }  // namespace

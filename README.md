@@ -6,9 +6,9 @@ A nerve is a bundle of axons carrying signals side by side. Axon bundles
 several TCP connections into one download, and if one is cut the others keep
 going and the transfer resumes from the exact byte.
 
-> Status: work in progress. `axon serve`, `axon list` and `axon fetch` work
-> over one connection; resume after a dropped connection and parallel
-> connections come next.
+> Status: work in progress. `axon serve`, `axon list` and `axon fetch` work,
+> and a download survives dropped connections; parallel connections come
+> next.
 
 ## Run
 
@@ -40,6 +40,18 @@ axon fetch localhost:9000 animals --output ./downloads
 Each file is downloaded to a hidden temporary file, checked against the CRC-32
 the server announced, and only then renamed to its real name, so a file you
 see is always complete. Other files in the folder are left alone.
+
+If the connection drops, `fetch` reconnects (with backoff), rejoins its
+session and continues every unfinished file from the exact byte it has. To see
+it, make the server cut connections on purpose:
+
+```sh
+axon serve --root ./datasets --fail-prob 0.7 --seed 1   # cut 70% of connections
+axon fetch localhost:9000 animals --output ./downloads
+# axon: connection closed after <n> of <m> bytes; reconnecting in <t> ms
+# ...
+# fetched animals: ... into downloads/animals, <k> reconnect(s)
+```
 
 ## Build
 

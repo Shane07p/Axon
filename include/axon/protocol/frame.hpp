@@ -22,6 +22,16 @@ void send_message(Socket& sock, const Message& msg);
 // injection.
 void send_truncated(Socket& sock, const Message& msg, std::size_t payload_bytes);
 
+struct FrameHeader {
+    std::uint32_t type = 0;
+    std::uint32_t length = 0;  // payload bytes that follow
+};
+
+// Reads one frame header, or returns nullopt if the peer closed cleanly
+// before it. Throws ConnectionClosed if it closed inside the header. For
+// callers that stream a payload themselves (see MessageReader::read_payload).
+[[nodiscard]] std::optional<FrameHeader> read_frame_header(Socket& sock);
+
 // Reads frames into a buffer it reuses, so receiving needs no allocation per
 // message. Not tied to one socket: keep it across reconnects.
 class MessageReader {
@@ -34,6 +44,9 @@ public:
     // over max_payload (checked before reading it) or a malformed payload.
     // Views in the result (Data::bytes) are valid until the next read().
     [[nodiscard]] std::optional<Message> read(Socket& sock);
+
+    // The rest of read(): the payload of a frame whose header was already read.
+    [[nodiscard]] Message read_payload(Socket& sock, const FrameHeader& header);
 
 private:
     std::size_t max_payload_;
