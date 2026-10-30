@@ -29,3 +29,9 @@ target_link_libraries(axon_unit_tests PRIVATE axon_core GTest::gtest_main)
 target_include_directories(axon_unit_tests PRIVATE ${PROJECT_SOURCE_DIR}/src)
 # A hang (blocked I/O, endless loop) fails the test instead of stalling the run.
 gtest_discover_tests(axon_unit_tests PROPERTIES TIMEOUT 30)
+
+# Runs the real binary end to end: serve, list, fetch, diff -r, Ctrl+C.
+find_program(BASH bash REQUIRED)
+add_test(NAME integration.serve_fetch
+         COMMAND ${BASH} ${CMAKE_CURRENT_SOURCE_DIR}/integration/serve_fetch.sh $<TARGET_FILE:axon>)
+set_tests_properties(integration.serve_fetch PROPERTIES TIMEOUT 120)

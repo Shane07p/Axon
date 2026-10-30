@@ -56,6 +56,11 @@ ctest --test-dir build --output-on-failure
 ./build/axon --version
 ```
 
+`ctest` runs the GoogleTest unit tests and an end-to-end test
+(`tests/integration/serve_fetch.sh`) that starts the real `axon serve`, runs
+`axon list` and `axon fetch` against it, compares the files with `diff -r`,
+checks the exit codes of error cases and stops the server with Ctrl+C.
+
 Sanitizer build (AddressSanitizer + UndefinedBehaviorSanitizer):
 
 ```sh
