@@ -11,6 +11,7 @@ FetchContent_MakeAvailable(googletest)
 include(GoogleTest)
 
 add_executable(axon_unit_tests
+    unit/bytes_test.cpp
     unit/fd_test.cpp
     unit/file_test.cpp
     unit/socket_test.cpp
