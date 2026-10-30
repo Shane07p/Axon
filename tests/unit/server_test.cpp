@@ -145,7 +145,24 @@ TEST_F(ServerTest, ServesManyClientsAtOnce) {
     }
 }
 
+TEST_F(ServerTest, ListsTopicsWithFileCountsAndSizes) {
+    write_file(dir_ / "plants" / "fern.txt", "green");
+    start();
+    auto sock = connect();
+    MessageReader reader;
+    const auto topics = std::get<Topics>(ask(sock, reader, List{}));
+    const Topics expected{{{"animals", 3, big.size() + 4}, {"plants", 1, 5}}};
+    EXPECT_EQ(topics, expected);
+    EXPECT_FALSE(reader.read(sock).has_value()) << "server should close after TOPS";
+}
+
 // --- refusals ---
+
+TEST_F(ServerTest, RefusesListFromOtherProtocolVersion) {
+    start();
+    auto sock = connect();
+    EXPECT_EQ(expect_err(sock, List{.version = 2}).code, ErrCode::BadVersion);
+}
 
 TEST_F(ServerTest, RefusesUnknownTopic) {
     start();

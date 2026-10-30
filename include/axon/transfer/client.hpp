@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include "axon/protocol/messages.hpp"
 
@@ -53,5 +54,11 @@ struct FetchStats {
 // ProtocolError, IntegrityError, or std::system_error / ConnectionClosed for
 // network and disk errors.
 FetchStats fetch(const FetchRequest& req);
+
+// Asks the server which topics it has, in name order. Throws ServerError,
+// ProtocolError, or std::system_error / ConnectionClosed.
+std::vector<proto::TopicInfo> list_topics(
+    const std::string& host, std::uint16_t port,
+    std::chrono::milliseconds timeout = std::chrono::seconds{30});
 
 }  // namespace axon

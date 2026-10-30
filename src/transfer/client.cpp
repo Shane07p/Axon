@@ -140,4 +140,18 @@ FetchStats fetch(const FetchRequest& req) {
     return stats;
 }
 
+std::vector<TopicInfo> list_topics(const std::string& host, std::uint16_t port,
+                                   std::chrono::milliseconds timeout) {
+    Socket sock = Socket::connect(host, port);
+    sock.set_timeouts(timeout);
+    MessageReader reader;
+    send_message(sock, List{});
+    Message reply = next(sock, reader);
+    auto* topics = std::get_if<Topics>(&reply);
+    if (topics == nullptr) {
+        protocol_error("expected TOPS");
+    }
+    return std::move(topics->topics);
+}
+
 }  // namespace axon

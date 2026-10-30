@@ -32,6 +32,8 @@ enum class MsgType : std::uint32_t {
     Req = tag("REQ "),
     Data = tag("DATA"),
     Ack = tag("ACK "),
+    List = tag("LIST"),
+    Topics = tag("TOPS"),
 };
 
 // One file of a topic. `crc` is the CRC-32 of its content.
@@ -42,9 +44,9 @@ struct FileEntry {
     bool operator==(const FileEntry&) const = default;
 };
 
-// C->S, first message on every connection. session_id 0 asks for a new
-// session. A Get from another protocol version decodes to just its version,
-// so the server can still answer Err{BadVersion}.
+// C->S, first message of a download. session_id 0 asks for a new session.
+// A Get from another protocol version decodes to just its version, so the
+// server can still answer Err{BadVersion}.
 struct Get {
     static constexpr MsgType type = MsgType::Get;
     std::uint16_t version = protocol_version;
@@ -111,7 +113,29 @@ struct Ack {
     bool operator==(const Ack&) const = default;
 };
 
-using Message = std::variant<Get, Ok, Err, Req, Data, Ack>;
+// C->S, first message instead of Get: which topics are there? Like Get, one
+// from another protocol version decodes to just its version.
+struct List {
+    static constexpr MsgType type = MsgType::List;
+    std::uint16_t version = protocol_version;
+    bool operator==(const List&) const = default;
+};
+
+struct TopicInfo {
+    std::string name{};
+    std::uint32_t files = 0;
+    std::uint64_t bytes = 0;
+    bool operator==(const TopicInfo&) const = default;
+};
+
+// S->C, answers List.
+struct Topics {
+    static constexpr MsgType type = MsgType::Topics;
+    std::vector<TopicInfo> topics{};
+    bool operator==(const Topics&) const = default;
+};
+
+using Message = std::variant<Get, Ok, Err, Req, Data, Ack, List, Topics>;
 
 [[nodiscard]] MsgType type_of(const Message& msg) noexcept;
 

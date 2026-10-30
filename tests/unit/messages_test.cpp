@@ -86,6 +86,30 @@ TEST(Messages, DataViewsThePayloadWithoutCopying) {
     EXPECT_EQ(d.bytes.data(), payload.data() + 12);  // points into the payload
 }
 
+TEST(Messages, ListAndTopicsRoundTrip) {
+    EXPECT_EQ(round_trip(List{}), List{});
+    EXPECT_EQ(encode(List{}), bytes_of({0x00, 0x01}));  // just the version
+    const Topics m{{{"animals", 3, 0xFFFF'FFFF'FFFF}, {"plants", 0, 0}}};
+    EXPECT_EQ(round_trip(m), m);
+    EXPECT_EQ(round_trip(Topics{}), Topics{});
+}
+
+TEST(Messages, ListFromAnotherVersionDecodesToJustTheVersion) {
+    const auto payload = bytes_of({0x00, 0x05, 0xAB, 0xCD});  // v5, unknown layout
+    EXPECT_EQ(std::get<List>(decode(tag_of(List{}), payload)).version, 5);
+}
+
+TEST(Messages, TopicsRejectsBadOrDuplicateNamesAndHugeCounts) {
+    for (const std::string name : {"", "..", "a/b", "has space"}) {
+        SCOPED_TRACE(name);
+        expect_rejected(Topics{{{name, 1, 1}}});
+    }
+    expect_rejected(Topics{{{"same", 1, 1}, {"same", 2, 2}}});
+    ByteWriter w;
+    w.put_u32(std::numeric_limits<std::uint32_t>::max());  // 4 billion topics, 0 bytes of them
+    EXPECT_THROW((void)decode(tag_of(Topics{}), w.view()), DecodeError);
+}
+
 TEST(Messages, AckHasEmptyPayload) {
     EXPECT_TRUE(encode(Ack{}).empty());
     EXPECT_TRUE(std::holds_alternative<Ack>(decode(tag_of(Ack{}), {})));
@@ -121,6 +145,9 @@ TEST(Messages, TruncatedOrPaddedPayloadsAreRejected) {
         Err{.code = ErrCode::Internal, .reason = "disk"},
         Req{{{.file_id = 1, .offset = 0, .length = 10}, {.file_id = 2, .offset = 5, .length = 1}}},
         Ack{},
+        List{},
+        Topics{},
+        Topics{{{"animals", 3, 1'000'000}, {"plants", 1, 6}}},
     };
     for (const auto& m : samples) {
         const auto payload = encode(m);

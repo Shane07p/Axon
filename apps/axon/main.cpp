@@ -29,6 +29,7 @@ namespace {
 constexpr std::string_view usage =
     "usage: axon serve --root DIR [--port PORT] [--bind ADDRESS]\n"
     "       axon fetch HOST[:PORT] TOPIC [--output DIR]\n"
+    "       axon list HOST[:PORT]\n"
     "       axon --version\n";
 
 constexpr std::uint16_t default_port = 9000;
@@ -150,6 +151,28 @@ int fetch(std::span<char* const> args) {
     return 0;
 }
 
+int list(std::span<char* const> args) {
+    if (args.size() != 1) {
+        throw UsageError("list needs HOST[:PORT] and nothing else");
+    }
+    const axon::Endpoint server = axon::parse_endpoint(args[0], default_port);
+    const auto topics = axon::list_topics(server.host, server.port);
+    if (topics.empty()) {
+        std::cout << "no topics\n";
+        return 0;
+    }
+    std::size_t width = std::string_view{"TOPIC"}.size();
+    for (const auto& t : topics) {
+        width = std::max(width, t.name.size());
+    }
+    std::cout << std::format("{:<{}}  {:>7}  {:>9}\n", "TOPIC", width, "FILES", "SIZE");
+    for (const auto& t : topics) {  // names were validated: no control characters
+        std::cout << std::format("{:<{}}  {:>7}  {:>9}\n", t.name, width, t.files,
+                                 human_bytes(t.bytes));
+    }
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char* argv[]) {
@@ -173,6 +196,9 @@ int main(int argc, char* argv[]) {
         }
         if (command == "fetch") {
             return fetch(args.subspan(1));
+        }
+        if (command == "list") {
+            return list(args.subspan(1));
         }
         throw UsageError(std::format("unknown command '{}'", command));
     } catch (const UsageError& e) {

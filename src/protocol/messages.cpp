@@ -16,6 +16,9 @@ constexpr std::uint64_t u64_max = std::numeric_limits<std::uint64_t>::max();
 // Smallest encoded FileEntry: name length (2) + 1-byte name + size (8) + crc (4).
 constexpr std::size_t min_entry_len = 2 + 1 + 8 + 4;
 
+// Smallest encoded TopicInfo: name length (2) + 1-byte name + files (4) + bytes (8).
+constexpr std::size_t min_topic_len = 2 + 1 + 4 + 8;
+
 [[noreturn]] void malformed(std::string_view what) {
     throw DecodeError("malformed " + std::string{what});
 }
@@ -86,6 +89,17 @@ void put(ByteWriter& w, const Data& m) {
 }
 
 void put(ByteWriter& /*w*/, const Ack& /*m*/) {}
+
+void put(ByteWriter& w, const List& m) { w.put_u16(m.version); }
+
+void put(ByteWriter& w, const Topics& m) {
+    w.put_u32(static_cast<std::uint32_t>(m.topics.size()));
+    for (const auto& t : m.topics) {
+        w.put_str(t.name);
+        w.put_u32(t.files);
+        w.put_u64(t.bytes);
+    }
+}
 
 // --- decoding ---
 
@@ -178,6 +192,44 @@ Data decode_data(ByteReader& r) {
     return m;
 }
 
+List decode_list(ByteReader& r) { return List{.version = r.get_u16()}; }
+
+Topics decode_topics(ByteReader& r) {
+    const std::uint32_t count = r.get_u32();
+    if (count > r.remaining() / min_topic_len) {
+        malformed("TOPS: topic count exceeds payload");
+    }
+    Topics m;
+    m.topics.reserve(count);
+    std::unordered_set<std::string_view> seen;
+    for (std::uint32_t i = 0; i < count; ++i) {
+        const auto name = r.get_str();
+        if (!is_valid_topic(name)) {
+            malformed("TOPS: invalid topic name");
+        }
+        if (!seen.insert(name).second) {
+            malformed("TOPS: duplicate topic name");
+        }
+        TopicInfo& t = m.topics.emplace_back();
+        t.name = name;
+        t.files = r.get_u32();
+        t.bytes = r.get_u64();
+    }
+    return m;
+}
+
+// A Get or List from another protocol version is decoded no further than its
+// version: the rest may use another layout.
+bool from_other_version(const Message& m) {
+    if (const auto* get = std::get_if<Get>(&m)) {
+        return get->version != protocol_version;
+    }
+    if (const auto* list = std::get_if<List>(&m)) {
+        return list->version != protocol_version;
+    }
+    return false;
+}
+
 Message decode_body(std::uint32_t t, ByteReader& r) {
     switch (static_cast<MsgType>(t)) {
         case MsgType::Get:
@@ -192,6 +244,10 @@ Message decode_body(std::uint32_t t, ByteReader& r) {
             return decode_data(r);
         case MsgType::Ack:
             return Ack{};
+        case MsgType::List:
+            return decode_list(r);
+        case MsgType::Topics:
+            return decode_topics(r);
     }
     throw DecodeError("unknown message type '" + printable_tag(t) + "'");
 }
@@ -213,8 +269,7 @@ std::vector<std::byte> encode(const Message& msg) {
 Message decode(std::uint32_t tag, std::span<const std::byte> payload) {
     ByteReader r{payload};
     Message msg = decode_body(tag, r);
-    const auto* get = std::get_if<Get>(&msg);
-    if (get == nullptr || get->version == protocol_version) {
+    if (!from_other_version(msg)) {
         r.expect_end();
     }
     return msg;

@@ -146,6 +146,31 @@ TEST_F(FetchTest, FileThatShrankOnTheServerLeavesNothingBehind) {
     EXPECT_FALSE(fs::exists(out() / "t" / "a.bin"));
 }
 
+TEST_F(FetchTest, ListsTheServersTopics) {
+    write_file(data() / "plants" / "fern.txt", "green");
+    write_file(data() / "animals" / "cat.txt", "meow");
+    write_file(data() / "animals" / "dog.txt", "woof!");
+    std::filesystem::create_directories(data() / "empty");
+    LiveServer server{data()};
+    const std::vector<TopicInfo> expected{{"animals", 2, 9}, {"empty", 0, 0}, {"plants", 1, 5}};
+    EXPECT_EQ(axon::list_topics("127.0.0.1", server.port(), 5s), expected);
+}
+
+TEST_F(FetchTest, ListOfAnEmptyDatasetIsEmpty) {
+    std::filesystem::create_directories(data());
+    LiveServer server{data()};
+    EXPECT_TRUE(axon::list_topics("127.0.0.1", server.port(), 5s).empty());
+}
+
+TEST_F(FetchTest, ListGetsProtocolErrorForAWrongReply) {
+    const FakeServer server{[](Socket& sock) {
+        MessageReader reader;
+        (void)reader.read(sock);
+        send_message(sock, Ack{});
+    }};
+    EXPECT_THROW((void)axon::list_topics("127.0.0.1", server.port(), 5s), axon::ProtocolError);
+}
+
 // --- before or without a server ---
 
 TEST_F(FetchTest, InvalidTopicIsRejectedBeforeConnecting) {

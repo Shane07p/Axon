@@ -79,21 +79,45 @@ std::uint64_t send_range(Socket& sock, const Topic& topic, const Range& r,
     return r.length;
 }
 
-// One client: GET -> OK, then REQ ... (answered with DATA) until ACK.
+void check_version(std::uint16_t version) {
+    if (version != protocol_version) {
+        reject(ErrCode::BadVersion, std::format("this server speaks protocol version {}, not {}",
+                                                protocol_version, version));
+    }
+}
+
+Topics summarize(const Dataset& dataset) {
+    Topics out;
+    for (const Topic& t : dataset.topics()) {
+        TopicInfo& info = out.topics.emplace_back();
+        info.name = t.name;
+        info.files = static_cast<std::uint32_t>(t.files.size());
+        for (const FileEntry& f : t.files) {
+            info.bytes += f.size;
+        }
+    }
+    return out;
+}
+
+// One client: LIST -> TOPS, or GET -> OK, then REQ ... (answered with DATA)
+// until ACK.
 void serve_client(Socket& sock, const Dataset& dataset, const std::string& who) {
     MessageReader reader{max_request_len};
     const auto first = reader.read(sock);
     if (!first) {
         return;  // connected and left without a word
     }
+    if (const auto* list = std::get_if<List>(&*first)) {
+        check_version(list->version);
+        send_message(sock, summarize(dataset));
+        log_msg("{}: LIST, {} topic(s)", who, dataset.topics().size());
+        return;
+    }
     const auto* get = std::get_if<Get>(&*first);
     if (get == nullptr) {
-        reject(ErrCode::BadRequest, "the first message must be GET");
+        reject(ErrCode::BadRequest, "the first message must be GET or LIST");
     }
-    if (get->version != protocol_version) {
-        reject(ErrCode::BadVersion, std::format("this server speaks protocol version {}, not {}",
-                                                protocol_version, get->version));
-    }
+    check_version(get->version);
     if (get->session_id != 0) {
         reject(ErrCode::SessionNotFound, "this server does not resume sessions");
     }

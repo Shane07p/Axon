@@ -6,9 +6,9 @@ A nerve is a bundle of axons carrying signals side by side. Axon bundles
 several TCP connections into one download, and if one is cut the others keep
 going and the transfer resumes from the exact byte.
 
-> Status: work in progress. `axon serve` and `axon fetch` work over one
-> connection; resume after a dropped connection and parallel connections come
-> next.
+> Status: work in progress. `axon serve`, `axon list` and `axon fetch` work
+> over one connection; resume after a dropped connection and parallel
+> connections come next.
 
 ## Run
 
@@ -28,6 +28,11 @@ Ctrl+C stops the server cleanly (a second Ctrl+C forces it). Symlinks,
 nested folders and unreadable files are skipped with a warning.
 
 ```sh
+axon list localhost:9000
+# TOPIC     FILES       SIZE
+# animals       2     <size>
+# plants        1     <size>
+
 axon fetch localhost:9000 animals --output ./downloads
 # fetched animals: <files>, <size> in <seconds> (<MB/s>) into downloads/animals
 ```
