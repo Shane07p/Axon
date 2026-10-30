@@ -19,6 +19,7 @@ add_executable(axon_unit_tests
     unit/frame_test.cpp
     unit/iov_test.cpp
     unit/messages_test.cpp
+    unit/server_test.cpp
     unit/socket_test.cpp
     unit/version_test.cpp)
 target_link_libraries(axon_unit_tests PRIVATE axon_core GTest::gtest_main)

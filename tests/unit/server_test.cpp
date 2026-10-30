@@ -1,0 +1,257 @@
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <filesystem>
+#include <memory>
+#include <span>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include <gtest/gtest.h>
+
+#include "axon/net/socket.hpp"
+#include "axon/protocol/bytes.hpp"
+#include "axon/protocol/frame.hpp"
+#include "axon/storage/dataset.hpp"
+#include "axon/transfer/server.hpp"
+#include "test_util.hpp"
+
+namespace {
+
+namespace fs = std::filesystem;
+using namespace axon::proto;
+using namespace std::chrono_literals;
+using axon::Dataset;
+using axon::Listener;
+using axon::Server;
+using axon::ServerConfig;
+using axon::Socket;
+using axon::test::write_file;
+
+std::string pattern(std::size_t n) {
+    std::string s(n, '\0');
+    for (std::size_t i = 0; i < n; ++i) {
+        s[i] = static_cast<char>('a' + i % 26);
+    }
+    return s;
+}
+
+// A server on a free loopback port, run on its own thread.
+class ServerTest : public axon::test::TempDirTest {
+protected:
+    const std::string big = pattern(150'000);  // spans several DATA frames
+
+    void SetUp() override {
+        TempDirTest::SetUp();
+        write_file(dir_ / "animals" / "big.bin", big);
+        write_file(dir_ / "animals" / "cat.txt", "meow");
+        write_file(dir_ / "animals" / "empty.txt", "");
+    }
+
+    void start(ServerConfig config = {.idle_timeout = 5s}) {
+        server_ = std::make_unique<Server>(Dataset::scan(dir_), Listener::listen("127.0.0.1", 0),
+                                           config);
+        thread_ = std::jthread{[this] { server_->run(); }};
+    }
+
+    void TearDown() override {
+        if (server_) {
+            server_->stop();
+            thread_.join();
+            server_.reset();
+        }
+        TempDirTest::TearDown();  // also checks the server closed every descriptor
+    }
+
+    Socket connect() const { return Socket::connect("127.0.0.1", server_->port()); }
+
+    std::unique_ptr<Server> server_;
+    std::jthread thread_;
+};
+
+Message ask(Socket& sock, MessageReader& reader, const Message& msg) {
+    send_message(sock, msg);
+    auto reply = reader.read(sock);
+    if (!reply) {
+        throw std::runtime_error("server closed without replying");
+    }
+    return std::move(*reply);
+}
+
+Err expect_err(Socket& sock, const Message& msg) {
+    MessageReader reader;
+    const auto reply = ask(sock, reader, msg);
+    if (!std::holds_alternative<Err>(reply)) {
+        ADD_FAILURE() << "expected ERR, got type " << static_cast<std::uint32_t>(type_of(reply));
+        return {};
+    }
+    EXPECT_FALSE(reader.read(sock).has_value()) << "server should close after ERR";
+    return std::get<Err>(reply);
+}
+
+// Collects DATA frames until `length` bytes of file `id` from `offset` arrived.
+std::string receive(Socket& sock, MessageReader& reader, std::uint32_t id, std::uint64_t offset,
+                    std::uint64_t length) {
+    std::string out;
+    while (out.size() < length) {
+        const auto msg = reader.read(sock);
+        if (!msg || !std::holds_alternative<Data>(*msg)) {
+            ADD_FAILURE() << "expected DATA";
+            return out;
+        }
+        const auto& d = std::get<Data>(*msg);
+        EXPECT_EQ(d.file_id, id);
+        EXPECT_EQ(d.offset, offset + out.size());
+        out.append(reinterpret_cast<const char*>(d.bytes.data()), d.bytes.size());
+    }
+    return out;
+}
+
+// --- the happy path ---
+
+TEST_F(ServerTest, ServesListAndRangesUntilAck) {
+    start();
+    auto sock = connect();
+    MessageReader reader;
+    const auto ok = std::get<Ok>(ask(sock, reader, Get{.topic = "animals"}));
+    EXPECT_EQ(ok.files, Dataset::scan(dir_).find("animals")->files);
+    ASSERT_EQ(ok.files->size(), 3u);
+    ASSERT_EQ((*ok.files)[0].name, "big.bin");
+
+    send_message(sock, Req{{{.file_id = 0, .offset = 0, .length = big.size()}}});
+    EXPECT_EQ(receive(sock, reader, 0, 0, big.size()), big);
+
+    // Two ranges in one REQ arrive in order; a range may start mid-file.
+    send_message(sock, Req{{{.file_id = 1, .offset = 1, .length = 3},
+                            {.file_id = 0, .offset = 70'000, .length = 5}}});
+    EXPECT_EQ(receive(sock, reader, 1, 1, 3), "eow");
+    EXPECT_EQ(receive(sock, reader, 0, 70'000, 5), big.substr(70'000, 5));
+
+    send_message(sock, Ack{});
+    EXPECT_FALSE(reader.read(sock).has_value()) << "server should close after ACK";
+}
+
+TEST_F(ServerTest, ServesManyClientsAtOnce) {
+    start();
+    std::vector<std::string> got(8);
+    {
+        std::vector<std::jthread> clients;
+        for (auto& out : got) {
+            clients.emplace_back([this, &out] {
+                auto sock = connect();
+                MessageReader reader;
+                (void)ask(sock, reader, Get{.topic = "animals"});
+                send_message(sock, Req{{{.file_id = 0, .offset = 0, .length = big.size()}}});
+                out = receive(sock, reader, 0, 0, big.size());
+                send_message(sock, Ack{});
+            });
+        }
+    }
+    for (const auto& out : got) {
+        EXPECT_EQ(out, big);
+    }
+}
+
+// --- refusals ---
+
+TEST_F(ServerTest, RefusesUnknownTopic) {
+    start();
+    auto sock = connect();
+    EXPECT_EQ(expect_err(sock, Get{.topic = "zebras"}).code, ErrCode::UnknownTopic);
+}
+
+TEST_F(ServerTest, RefusesOtherProtocolVersion) {
+    start();
+    auto sock = connect();
+    EXPECT_EQ(expect_err(sock, Get{.version = 99, .topic = "animals"}).code, ErrCode::BadVersion);
+}
+
+TEST_F(ServerTest, RefusesSessionResume) {
+    start();
+    auto sock = connect();
+    EXPECT_EQ(expect_err(sock, Get{.topic = "animals", .session_id = 7}).code,
+              ErrCode::SessionNotFound);
+}
+
+TEST_F(ServerTest, FirstMessageMustBeGet) {
+    start();
+    auto sock = connect();
+    EXPECT_EQ(expect_err(sock, Ack{}).code, ErrCode::BadRequest);
+}
+
+TEST_F(ServerTest, MalformedFrameGetsBadRequest) {
+    start();
+    auto sock = connect();
+    std::array<std::byte, frame_header_len> header{};
+    axon::store_be(std::span{header}.first<4>(), tag("NOPE"));
+    sock.send_all(header);
+    MessageReader reader;
+    const auto reply = reader.read(sock);
+    ASSERT_TRUE(reply.has_value());
+    ASSERT_TRUE(std::holds_alternative<Err>(*reply));
+    EXPECT_EQ(std::get<Err>(*reply).code, ErrCode::BadRequest);
+}
+
+TEST_F(ServerTest, RefusesRangesOutsideTheFiles) {
+    start();
+    for (const Range bad : {Range{.file_id = 9, .offset = 0, .length = 1},
+                            Range{.file_id = 1, .offset = 0, .length = 5},     // cat.txt is 4 bytes
+                            Range{.file_id = 2, .offset = 0, .length = 1}}) {  // empty.txt
+        auto sock = connect();
+        MessageReader reader;
+        (void)ask(sock, reader, Get{.topic = "animals"});
+        send_message(sock, Req{{bad}});
+        const auto reply = reader.read(sock);
+        ASSERT_TRUE(reply.has_value());
+        ASSERT_TRUE(std::holds_alternative<Err>(*reply)) << "file " << bad.file_id;
+        EXPECT_EQ(std::get<Err>(*reply).code, ErrCode::BadRange);
+    }
+}
+
+TEST_F(ServerTest, ReportsFileThatShrankSinceTheScan) {
+    start();
+    fs::resize_file(dir_ / "animals" / "big.bin", 10);
+    auto sock = connect();
+    MessageReader reader;
+    (void)ask(sock, reader, Get{.topic = "animals"});
+    send_message(sock, Req{{{.file_id = 0, .offset = 0, .length = big.size()}}});
+    (void)receive(sock, reader, 0, 0, 10);  // what is left is still sent
+    const auto reply = reader.read(sock);
+    ASSERT_TRUE(reply.has_value());
+    ASSERT_TRUE(std::holds_alternative<Err>(*reply));
+    EXPECT_EQ(std::get<Err>(*reply).code, ErrCode::Internal);
+}
+
+// --- lifecycle ---
+
+TEST_F(ServerTest, StopClosesConnectedClientsPromptly) {
+    start();
+    auto idle = connect();  // connected, never sends anything
+    auto mid = connect();   // stopped mid-session
+    MessageReader reader;
+    (void)ask(mid, reader, Get{.topic = "animals"});
+
+    const auto t0 = std::chrono::steady_clock::now();
+    server_->stop();
+    thread_.join();  // run() returns only after every connection thread is joined
+    EXPECT_LT(std::chrono::steady_clock::now() - t0, 2s);
+
+    MessageReader r2;
+    EXPECT_FALSE(r2.read(idle).has_value());
+    EXPECT_FALSE(reader.read(mid).has_value());
+    server_.reset();
+}
+
+TEST_F(ServerTest, DropsClientThatStaysSilent) {
+    start({.idle_timeout = 200ms});
+    auto sock = connect();
+    const auto t0 = std::chrono::steady_clock::now();
+    MessageReader reader;
+    EXPECT_FALSE(reader.read(sock).has_value());  // the server hangs up on us
+    EXPECT_GE(std::chrono::steady_clock::now() - t0, 150ms);
+}
+
+}  // namespace

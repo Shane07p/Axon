@@ -6,7 +6,25 @@ A nerve is a bundle of axons carrying signals side by side. Axon bundles
 several TCP connections into one download, and if one is cut the others keep
 going and the transfer resumes from the exact byte.
 
-> Status: early setup. Only `axon --version` works so far.
+> Status: work in progress. The server (`axon serve`) works; the client
+> (`axon fetch`, `axon list`) comes next.
+
+## Run
+
+A dataset is a folder of topics; each topic is a sub-folder of files:
+
+```
+datasets/
+├── animals/   cat.jpg  dog.jpg
+└── plants/    fern.txt
+```
+
+```sh
+axon serve --root ./datasets --port 9000
+```
+
+Ctrl+C stops the server cleanly (a second Ctrl+C forces it). Symlinks,
+nested folders and unreadable files are skipped with a warning.
 
 ## Build
 
@@ -36,6 +54,9 @@ ctest --test-dir build-asan --output-on-failure
 ```
 apps/axon/       CLI entry point
 include/axon/    public headers of the core library
-src/             core library (axon_core)
+src/net/         sockets
+src/protocol/    message encoding and framing
+src/storage/     files and the dataset scanner
+src/transfer/    server (client to come)
 tests/unit/      GoogleTest unit tests
 ```

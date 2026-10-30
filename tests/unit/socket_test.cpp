@@ -1,8 +1,10 @@
 #include <sys/socket.h>
 
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string_view>
@@ -132,6 +134,47 @@ TEST_F(SocketTest, LargeTransferOverTcpArrivesIntact) {
     std::vector<std::byte> got(sent.size());
     ASSERT_TRUE(server.recv_all(got));
     EXPECT_EQ(got, sent);
+}
+
+TEST_F(SocketTest, TimeoutTurnsASilentPeerIntoAnError) {
+    using namespace std::chrono_literals;
+    auto [a, b] = Socket::pair();
+    b.set_timeouts(100ms);
+    std::array<std::byte, 1> buf{};
+    try {
+        (void)b.recv_all(buf);
+        FAIL() << "recv should have timed out";
+    } catch (const std::system_error& e) {
+        EXPECT_EQ(e.code(), std::errc::timed_out) << e.what();
+    }
+}
+
+TEST_F(SocketTest, ShutdownWakesAThreadBlockedInRecv) {
+    auto [a, b] = Socket::pair();
+    Socket& rx = b;
+    bool got_data = true;
+    std::jthread reader{[&rx, &got_data] {
+        std::array<std::byte, 1> buf{};
+        got_data = rx.recv_all(buf);
+    }};
+    std::this_thread::sleep_for(std::chrono::milliseconds{50});  // let it block
+    b.shutdown();
+    reader.join();
+    EXPECT_FALSE(got_data);
+}
+
+TEST_F(SocketTest, TryAcceptDoesNotWaitWhenNobodyConnects) {
+    const auto listener = Listener::listen("127.0.0.1", 0);
+    EXPECT_FALSE(listener.try_accept().has_value());
+    const auto client = Socket::connect("127.0.0.1", listener.local_port());
+    std::optional<Socket> server;
+    for (int i = 0; i < 100 && !server; ++i) {  // the handshake completes asynchronously
+        server = listener.try_accept();
+        if (!server) {
+            std::this_thread::sleep_for(std::chrono::milliseconds{10});
+        }
+    }
+    EXPECT_TRUE(server.has_value());
 }
 
 }  // namespace

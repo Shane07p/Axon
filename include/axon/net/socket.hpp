@@ -1,7 +1,9 @@
 #pragma once
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -18,7 +20,8 @@ public:
 };
 
 // A connected stream socket. Closes itself when destroyed; move-only.
-// I/O errors (reset, timeout, writing to a closed peer) throw std::system_error.
+// I/O errors (reset, writing to a closed peer, a timeout from set_timeouts,
+// reported as ETIMEDOUT) throw std::system_error.
 class Socket {
 public:
     Socket() noexcept = default;
@@ -40,6 +43,14 @@ public:
     // a single byte; throws ConnectionClosed if it closed part-way through.
     [[nodiscard]] bool recv_all(std::span<std::byte> buf);
 
+    // Makes any single send or receive that waits longer than `t` fail with
+    // ETIMEDOUT, so a silent or stalled peer cannot block a thread forever.
+    void set_timeouts(std::chrono::milliseconds t);
+
+    // Ends both directions now, keeping the descriptor open. Safe while another
+    // thread is blocked in send_all/recv_all on this socket: that call returns.
+    void shutdown() noexcept;
+
     [[nodiscard]] int fd() const noexcept { return fd_.get(); }
     explicit operator bool() const noexcept { return static_cast<bool>(fd_); }
 
@@ -59,6 +70,10 @@ public:
 
     // Blocks until a client connects.
     [[nodiscard]] Socket accept() const;
+
+    // Returns a waiting client, or nullopt at once if there is none (the
+    // listener is non-blocking, so this pairs with poll()).
+    [[nodiscard]] std::optional<Socket> try_accept() const;
 
     [[nodiscard]] std::uint16_t local_port() const;
     [[nodiscard]] int fd() const noexcept { return fd_.get(); }

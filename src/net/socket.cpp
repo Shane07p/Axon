@@ -3,7 +3,9 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 
 #include <array>
 #include <cerrno>
@@ -64,6 +66,9 @@ void Socket::send_all(std::span<const std::byte> head, std::span<const std::byte
             if (errno == EINTR) {
                 continue;
             }
+            if (errno == EAGAIN) {
+                errno = ETIMEDOUT;  // only a send timeout makes a blocking socket say EAGAIN
+            }
             detail::throw_errno("send");
         }
         first = detail::skip_written(iov, first, static_cast<std::size_t>(n));
@@ -83,11 +88,26 @@ bool Socket::recv_all(std::span<std::byte> buf) {
             throw ConnectionClosed("connection closed after " + std::to_string(done) + " of " +
                                    std::to_string(buf.size()) + " bytes");
         } else if (errno != EINTR) {
+            if (errno == EAGAIN) {
+                errno = ETIMEDOUT;  // only a receive timeout makes a blocking socket say EAGAIN
+            }
             detail::throw_errno("recv");
         }
     }
     return true;
 }
+
+void Socket::set_timeouts(std::chrono::milliseconds t) {
+    const auto us = std::chrono::duration_cast<std::chrono::microseconds>(t).count();
+    const timeval tv{.tv_sec = static_cast<time_t>(us / 1'000'000),
+                     .tv_usec = static_cast<suseconds_t>(us % 1'000'000)};
+    if (::setsockopt(fd(), SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv) != 0 ||
+        ::setsockopt(fd(), SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv) != 0) {
+        detail::throw_errno("setsockopt timeout");
+    }
+}
+
+void Socket::shutdown() noexcept { ::shutdown(fd(), SHUT_RDWR); }
 
 Listener Listener::listen(const std::string& address, std::uint16_t port) {
     const std::string where = address + ":" + std::to_string(port);
@@ -99,7 +119,7 @@ Listener Listener::listen(const std::string& address, std::uint16_t port) {
         throw std::invalid_argument("not an IPv4 address: " + address);
     }
 
-    Fd fd{::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0)};
+    Fd fd{::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0)};
     if (!fd) {
         detail::throw_errno("socket");
     }
@@ -119,15 +139,27 @@ Listener Listener::listen(const std::string& address, std::uint16_t port) {
 
 Socket Listener::accept() const {
     for (;;) {
-        Fd fd{::accept4(fd_.get(), nullptr, nullptr, SOCK_CLOEXEC)};
-        if (fd) {
-            return Socket{std::move(fd)};
+        if (auto sock = try_accept()) {
+            return std::move(*sock);
         }
-        // The client gave up before we accepted it: wait for the next one.
-        if (errno != EINTR && errno != ECONNABORTED) {
-            detail::throw_errno("accept");
+        pollfd p{.fd = fd_.get(), .events = POLLIN, .revents = 0};
+        if (::poll(&p, 1, -1) < 0 && errno != EINTR) {
+            detail::throw_errno("poll");
         }
     }
+}
+
+std::optional<Socket> Listener::try_accept() const {
+    // Accepted sockets are blocking: SOCK_NONBLOCK is not inherited by accept4.
+    Fd fd{::accept4(fd_.get(), nullptr, nullptr, SOCK_CLOEXEC)};
+    if (fd) {
+        return Socket{std::move(fd)};
+    }
+    // Nothing waiting, interrupted, or the client gave up before we got to it.
+    if (errno == EAGAIN || errno == EINTR || errno == ECONNABORTED) {
+        return std::nullopt;
+    }
+    detail::throw_errno("accept");
 }
 
 std::uint16_t Listener::local_port() const {

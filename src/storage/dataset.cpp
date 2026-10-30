@@ -69,9 +69,14 @@ std::optional<Topic> scan_topic(const fs::path& dir, std::string name,
 }  // namespace
 
 Dataset Dataset::scan(const fs::path& root) {
+    std::error_code open_ec;
+    fs::directory_iterator topics{root, open_ec};
+    if (open_ec) {
+        throw fs::filesystem_error("cannot open dataset folder", root, open_ec);
+    }
     Dataset d;
     std::vector<std::byte> buf(read_chunk);
-    for (const fs::directory_entry& entry : fs::directory_iterator{root}) {
+    for (const fs::directory_entry& entry : topics) {
         const std::string name = entry.path().filename().string();
         std::error_code ec;
         const fs::file_status st = entry.symlink_status(ec);

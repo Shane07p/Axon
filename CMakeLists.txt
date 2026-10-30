@@ -32,19 +32,23 @@ if(AXON_SANITIZE)
     target_link_options(axon_options INTERFACE -fsanitize=${AXON_SANITIZE})
 endif()
 
+find_package(Threads REQUIRED)
+
 # Core library: everything except the CLI lives here so tests can link it.
 add_library(axon_core
     src/fd.cpp
+    src/log.cpp
     src/net/socket.cpp
     src/protocol/bytes.cpp
     src/protocol/frame.cpp
     src/protocol/messages.cpp
     src/storage/dataset.cpp
     src/storage/file.cpp
+    src/transfer/server.cpp
     src/version.cpp)
 target_include_directories(axon_core PUBLIC include PRIVATE src)
 target_compile_definitions(axon_core PRIVATE AXON_VERSION="${PROJECT_VERSION}")
-target_link_libraries(axon_core PUBLIC axon_options)
+target_link_libraries(axon_core PUBLIC axon_options Threads::Threads)
 
 add_executable(axon apps/axon/main.cpp)
 target_link_libraries(axon PRIVATE axon_core)
