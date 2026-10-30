@@ -46,6 +46,7 @@ public:
     void put_u16(std::uint16_t v) { put(v); }
     void put_u32(std::uint32_t v) { put(v); }
     void put_u64(std::uint64_t v) { put(v); }
+    // `data` (and `s` below) may view this writer's own bytes.
     void put_bytes(std::span<const std::byte> data);
 
     // Throws std::length_error if `s` is longer than 65535 bytes.
@@ -61,6 +62,9 @@ private:
         buf_.resize(buf_.size() + sizeof(T));
         store_be(std::span{buf_}.last<sizeof(T)>(), v);
     }
+
+    // Appends `head` then `data` with a single resize; `data` may alias buf_.
+    void append(std::span<const std::byte> head, std::span<const std::byte> data);
 
     std::vector<std::byte> buf_;
 };

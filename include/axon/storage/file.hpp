@@ -10,7 +10,8 @@
 namespace axon {
 
 // An open regular file with positional reads and writes. Closes itself when
-// destroyed; move-only. Errors throw std::system_error naming the path.
+// destroyed; move-only. Errors throw std::system_error naming the path,
+// including opening anything but a regular file (directory, FIFO, device).
 class File {
 public:
     File() noexcept = default;

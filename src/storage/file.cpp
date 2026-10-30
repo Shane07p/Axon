@@ -5,6 +5,8 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <string>
+#include <system_error>
 #include <utility>
 
 #include "sys_error.hpp"
@@ -15,9 +17,19 @@ File::File(Fd fd, std::filesystem::path path) noexcept
     : fd_{std::move(fd)}, path_{std::move(path)} {}
 
 File File::open(const std::filesystem::path& path, int flags) {
-    Fd fd{::open(path.c_str(), flags | O_CLOEXEC, 0644)};
+    // O_NONBLOCK stops a FIFO with no writer from blocking open(). It has no
+    // effect on regular files, the only kind accepted below.
+    Fd fd{::open(path.c_str(), flags | O_CLOEXEC | O_NONBLOCK, 0644)};
     if (!fd) {
         detail::throw_errno("open", path.native());
+    }
+    struct stat st{};
+    if (::fstat(fd.get(), &st) != 0) {
+        detail::throw_errno("stat", path.native());
+    }
+    if (!S_ISREG(st.st_mode)) {
+        throw std::system_error(S_ISDIR(st.st_mode) ? EISDIR : EINVAL, std::generic_category(),
+                                "open " + path.native() + ": not a regular file");
     }
     return File{std::move(fd), path};
 }

@@ -1,3 +1,5 @@
+#include <sys/stat.h>
+
 #include <array>
 #include <cstddef>
 #include <cstdlib>
@@ -81,6 +83,35 @@ TEST_F(FileTest, TruncateCutsTheTail) {
     f.truncate(4);
     EXPECT_EQ(f.size(), 4u);
     EXPECT_EQ(read_all(f), "0123");
+}
+
+TEST_F(FileTest, RejectsDirectories) {
+    for (const bool write : {false, true}) {
+        try {
+            (void)(write ? File::open_write(dir_) : File::open_read(dir_));
+            FAIL() << "opened a directory, write=" << write;
+        } catch (const std::system_error& e) {
+            EXPECT_EQ(e.code(), std::errc::is_a_directory) << e.what();
+        }
+    }
+}
+
+TEST_F(FileTest, RejectsFifoWithoutBlocking) {
+    const auto fifo = dir_ / "pipe";
+    ASSERT_EQ(::mkfifo(fifo.c_str(), 0600), 0);
+    // No writer exists: a blocking open would hang here until the test times out.
+    EXPECT_THROW((void)File::open_read(fifo), std::system_error);
+    EXPECT_THROW((void)File::open_write(fifo), std::system_error);
+}
+
+TEST_F(FileTest, RejectsDevices) {
+    try {
+        (void)File::open_read("/dev/null");
+        FAIL() << "opened a character device";
+    } catch (const std::system_error& e) {
+        EXPECT_NE(std::string_view{e.what()}.find("not a regular file"), std::string_view::npos)
+            << e.what();
+    }
 }
 
 TEST_F(FileTest, OpenMissingFileThrowsWithPath) {

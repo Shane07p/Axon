@@ -63,6 +63,33 @@ TEST(ByteWriter, RejectsStringLongerThanU16) {
     EXPECT_EQ(w.size(), 0u);
 }
 
+TEST(ByteWriter, PutStrMayCopyFromItsOwnBuffer) {
+    ByteWriter w;
+    w.put_str("abc");
+    for (int i = 0; i < 8; ++i) {  // the buffer grows (and moves) while copying
+        ByteReader r{w.view()};
+        w.put_str(r.get_str());
+    }
+    ByteReader r{w.view()};
+    for (int i = 0; i < 9; ++i) {
+        EXPECT_EQ(r.get_str(), "abc");
+    }
+    EXPECT_NO_THROW(r.expect_end());
+}
+
+TEST(ByteWriter, PutBytesMayCopyFromItsOwnBuffer) {
+    ByteWriter w;
+    w.put_u32(0x01020304);
+    for (int i = 0; i < 6; ++i) {
+        w.put_bytes(w.view());  // doubles: 4 -> 256 bytes
+    }
+    ASSERT_EQ(w.size(), 256u);
+    ByteReader r{w.view()};
+    for (int i = 0; i < 64; ++i) {
+        EXPECT_EQ(r.get_u32(), 0x01020304u);
+    }
+}
+
 TEST(ByteWriter, TakeMovesTheBytesOut) {
     ByteWriter w;
     w.put_u32(42);
