@@ -124,6 +124,104 @@ TEST_F(ServerTest, ServesListAndRangesUntilAck) {
     EXPECT_FALSE(reader.read(sock).has_value()) << "server should close after ACK";
 }
 
+// --- sessions ---
+
+TEST_F(ServerTest, EachDownloadGetsItsOwnSession) {
+    start();
+    auto a = connect();
+    auto b = connect();
+    MessageReader ra;
+    MessageReader rb;
+    const auto ok_a = std::get<Ok>(ask(a, ra, Get{.topic = "animals"}));
+    const auto ok_b = std::get<Ok>(ask(b, rb, Get{.topic = "animals"}));
+    EXPECT_NE(ok_a.session_id, 0u);
+    EXPECT_NE(ok_a.session_id, ok_b.session_id);
+}
+
+TEST_F(ServerTest, ResumesAtTheExactByteAfterACut) {
+    start();
+    std::uint64_t session = 0;
+    std::string got;
+    {
+        auto sock = connect();
+        MessageReader reader;
+        session = std::get<Ok>(ask(sock, reader, Get{.topic = "animals"})).session_id;
+        send_message(sock, Req{{{.file_id = 0, .offset = 0, .length = big.size()}}});
+        got = receive(sock, reader, 0, 0, 2 * max_data_len);  // two frames, then the line drops
+    }
+
+    auto sock = connect();
+    MessageReader reader;
+    const auto ok = std::get<Ok>(ask(sock, reader, Get{.topic = "animals", .session_id = session}));
+    EXPECT_EQ(ok.session_id, session);
+    EXPECT_FALSE(ok.files.has_value()) << "the client already has the list";
+    const std::uint64_t at = got.size();
+    send_message(sock, Req{{{.file_id = 0, .offset = at, .length = big.size() - at}}});
+    got += receive(sock, reader, 0, at, big.size() - at);
+    EXPECT_EQ(got, big);
+    send_message(sock, Ack{});
+    EXPECT_FALSE(reader.read(sock).has_value());
+
+    server_->stop();
+    const auto stats = server_->stats();
+    EXPECT_EQ(stats.sessions_finished, 1u);
+    // Bytes in flight at the cut were sent twice; every byte still reached
+    // the client exactly once.
+    EXPECT_EQ(stats.payload_bytes - stats.redundant_bytes, big.size());
+}
+
+TEST_F(ServerTest, ResumeCanAskForTheListAgain) {
+    start();
+    auto first = connect();
+    MessageReader r1;
+    const auto ok = std::get<Ok>(ask(first, r1, Get{.topic = "animals"}));
+    auto again = connect();
+    MessageReader r2;
+    const auto resumed = std::get<Ok>(
+        ask(again, r2, Get{.topic = "animals", .session_id = ok.session_id, .want_list = true}));
+    EXPECT_EQ(resumed.files, ok.files);
+}
+
+TEST_F(ServerTest, SessionBelongsToOneTopic) {
+    write_file(dir_ / "plants" / "fern.txt", "green");
+    start();
+    auto first = connect();
+    MessageReader reader;
+    const auto ok = std::get<Ok>(ask(first, reader, Get{.topic = "animals"}));
+    auto other = connect();
+    EXPECT_EQ(expect_err(other, Get{.topic = "plants", .session_id = ok.session_id}).code,
+              ErrCode::TopicMismatch);
+}
+
+TEST_F(ServerTest, AckEndsTheSession) {
+    start();
+    std::uint64_t session = 0;
+    {
+        auto sock = connect();
+        MessageReader reader;
+        session = std::get<Ok>(ask(sock, reader, Get{.topic = "animals"})).session_id;
+        send_message(sock, Ack{});
+        EXPECT_FALSE(reader.read(sock).has_value());
+    }
+    auto sock = connect();
+    EXPECT_EQ(expect_err(sock, Get{.topic = "animals", .session_id = session}).code,
+              ErrCode::SessionNotFound);
+}
+
+TEST_F(ServerTest, AbandonedSessionExpires) {
+    start({.idle_timeout = 5s, .session_ttl = 100ms});
+    std::uint64_t session = 0;
+    {
+        auto sock = connect();
+        MessageReader reader;
+        session = std::get<Ok>(ask(sock, reader, Get{.topic = "animals"})).session_id;
+    }  // the client gives up
+    std::this_thread::sleep_for(300ms);
+    auto sock = connect();
+    EXPECT_EQ(expect_err(sock, Get{.topic = "animals", .session_id = session}).code,
+              ErrCode::SessionNotFound);
+}
+
 TEST_F(ServerTest, ServesManyClientsAtOnce) {
     start();
     std::vector<std::string> got(8);

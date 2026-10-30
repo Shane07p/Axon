@@ -41,9 +41,9 @@ public:
 
 [[noreturn]] void reject(ErrCode code, const std::string& reason) { throw Rejection{code, reason}; }
 
-// Streams one requested range as DATA frames. Returns the bytes sent.
-std::uint64_t send_range(Socket& sock, const Topic& topic, const Range& r,
-                         std::vector<std::byte>& buf) {
+// Streams one requested range as DATA frames, recording them in `session`.
+void send_range(Socket& sock, Session& session, const Range& r, std::vector<std::byte>& buf) {
+    const Topic& topic = session.topic();
     if (r.file_id >= topic.files.size()) {
         reject(ErrCode::BadRange, std::format("no file with id {}", r.file_id));
     }
@@ -74,9 +74,9 @@ std::uint64_t send_range(Socket& sock, const Topic& topic, const Range& r,
             reject(ErrCode::Internal, std::format("{} shrank since the server started", entry.name));
         }
         send_message(sock, Data{.file_id = r.file_id, .offset = pos, .bytes = std::span{buf}.first(n)});
+        session.record_sent(r.file_id, pos, n);
         pos += n;
     }
-    return r.length;
 }
 
 void check_version(std::uint16_t version) {
@@ -99,61 +99,13 @@ Topics summarize(const Dataset& dataset) {
     return out;
 }
 
-// One client: LIST -> TOPS, or GET -> OK, then REQ ... (answered with DATA)
-// until ACK.
-void serve_client(Socket& sock, const Dataset& dataset, const std::string& who) {
-    MessageReader reader{max_request_len};
-    const auto first = reader.read(sock);
-    if (!first) {
-        return;  // connected and left without a word
-    }
-    if (const auto* list = std::get_if<List>(&*first)) {
-        check_version(list->version);
-        send_message(sock, summarize(dataset));
-        log_msg("{}: LIST, {} topic(s)", who, dataset.topics().size());
-        return;
-    }
-    const auto* get = std::get_if<Get>(&*first);
-    if (get == nullptr) {
-        reject(ErrCode::BadRequest, "the first message must be GET or LIST");
-    }
-    check_version(get->version);
-    if (get->session_id != 0) {
-        reject(ErrCode::SessionNotFound, "this server does not resume sessions");
-    }
-    const Topic* topic = dataset.find(get->topic);
-    if (topic == nullptr) {
-        reject(ErrCode::UnknownTopic, std::format("no topic named '{}'", get->topic));
-    }
-    send_message(sock, Ok{.files = topic->files});
-    log_msg("{}: GET {}, {} file(s)", who, topic->name, topic->files.size());
-
-    const auto start = std::chrono::steady_clock::now();
-    std::vector<std::byte> buf(max_data_len);
-    std::uint64_t sent = 0;
-    while (const auto msg = reader.read(sock)) {
-        if (const auto* req = std::get_if<Req>(&*msg)) {
-            for (const Range& r : req->ranges) {
-                sent += send_range(sock, *topic, r, buf);
-            }
-        } else if (std::holds_alternative<Ack>(*msg)) {
-            const std::chrono::duration<double> took = std::chrono::steady_clock::now() - start;
-            log_msg("{}: done, {} bytes in {:.2f} s ({:.1f} MB/s)", who, sent, took.count(),
-                    static_cast<double>(sent) / 1e6 / std::max(took.count(), 1e-9));
-            return;
-        } else {
-            reject(ErrCode::BadRequest, "expected REQ or ACK");
-        }
-    }
-    log_msg("{}: client left before ACK, after {} bytes", who, sent);
-}
-
 }  // namespace
 
 Server::Server(Dataset dataset, Listener listener, ServerConfig config)
     : dataset_{std::move(dataset)},
       listener_{std::move(listener)},
       config_{config},
+      sessions_{config.session_ttl},
       wake_{::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK)} {
     if (!wake_) {
         detail::throw_errno("eventfd");
@@ -161,6 +113,91 @@ Server::Server(Dataset dataset, Listener listener, ServerConfig config)
 }
 
 Server::~Server() { close_all(); }
+
+ServerStats Server::stats() const {
+    return {.sessions_finished = sessions_finished_.load(),
+            .payload_bytes = payload_bytes_.load(),
+            .redundant_bytes = redundant_bytes_.load()};
+}
+
+// One client: LIST -> TOPS, or GET -> OK, then REQ ... (answered with DATA)
+// until ACK. A GET with a session id resumes that session.
+void Server::serve_client(Socket& sock, const std::string& who) {
+    MessageReader reader{max_request_len};
+    const auto first = reader.read(sock);
+    if (!first) {
+        return;  // connected and left without a word
+    }
+    if (const auto* list = std::get_if<List>(&*first)) {
+        check_version(list->version);
+        send_message(sock, summarize(dataset_));
+        log_msg("{}: LIST, {} topic(s)", who, dataset_.topics().size());
+        return;
+    }
+    const auto* get = std::get_if<Get>(&*first);
+    if (get == nullptr) {
+        reject(ErrCode::BadRequest, "the first message must be GET or LIST");
+    }
+    check_version(get->version);
+
+    std::shared_ptr<Session> session;
+    Ok ok;
+    if (get->session_id == 0) {
+        const Topic* topic = dataset_.find(get->topic);
+        if (topic == nullptr) {
+            reject(ErrCode::UnknownTopic, std::format("no topic named '{}'", get->topic));
+        }
+        session = sessions_.create(*topic);
+        ok.files = topic->files;
+        log_msg("{}: GET {}, new session {:016x}, {} file(s)", who, topic->name, session->id(),
+                topic->files.size());
+    } else {
+        session = sessions_.find(get->session_id);
+        if (session == nullptr) {
+            reject(ErrCode::SessionNotFound, "unknown, finished or expired session");
+        }
+        if (session->topic().name != get->topic) {
+            reject(ErrCode::TopicMismatch,
+                   std::format("that session is for topic '{}'", session->topic().name));
+        }
+        if (get->want_list) {
+            ok.files = session->topic().files;
+        }
+        log_msg("{}: resuming session {:016x}", who, session->id());
+    }
+    session->connected();
+    ok.session_id = session->id();
+    send_message(sock, ok);
+
+    std::vector<std::byte> buf(max_data_len);
+    while (const auto msg = reader.read(sock)) {
+        if (const auto* req = std::get_if<Req>(&*msg)) {
+            for (const Range& r : req->ranges) {
+                send_range(sock, *session, r, buf);
+            }
+        } else if (std::holds_alternative<Ack>(*msg)) {
+            finish(*session, who);
+            return;
+        } else {
+            reject(ErrCode::BadRequest, "expected REQ or ACK");
+        }
+    }
+    log_msg("{}: client left before ACK; session {:016x} kept for resume", who, session->id());
+}
+
+void Server::finish(const Session& session, const std::string& who) {
+    sessions_.finish(session.id());
+    const SessionStats st = session.stats();
+    sessions_finished_.fetch_add(1);
+    payload_bytes_.fetch_add(st.payload);
+    redundant_bytes_.fetch_add(st.redundant);
+    const std::chrono::duration<double> took = Session::Clock::now() - session.started();
+    log_msg("{}: session {:016x} done: {} bytes in {:.2f} s ({:.1f} MB/s), {} resent, "
+            "{} connection(s)",
+            who, session.id(), st.payload, took.count(),
+            static_cast<double>(st.payload) / 1e6 / std::max(took.count(), 1e-9), st.redundant,
+            st.connections);
+}
 
 void Server::stop() noexcept {
     stopping_.store(true);
@@ -224,7 +261,7 @@ void Server::serve(Conn& conn) {
     const std::string who = std::format("conn {}", conn.id);
     try {
         conn.sock.set_timeouts(config_.idle_timeout);
-        serve_client(conn.sock, dataset_, who);
+        serve_client(conn.sock, who);
     } catch (const Rejection& r) {
         log_msg("{}: refused, {}: {}", who, proto::to_string(r.code), r.what());
         try {

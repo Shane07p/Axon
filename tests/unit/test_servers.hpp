@@ -34,6 +34,7 @@ public:
     }
 
     [[nodiscard]] std::uint16_t port() const { return server_.port(); }
+    [[nodiscard]] ServerStats stats() const { return server_.stats(); }
 
 private:
     Server server_;

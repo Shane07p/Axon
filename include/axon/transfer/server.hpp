@@ -5,17 +5,28 @@
 #include <cstdint>
 #include <list>
 #include <mutex>
+#include <string>
 #include <thread>
 
 #include "axon/fd.hpp"
 #include "axon/net/socket.hpp"
 #include "axon/storage/dataset.hpp"
+#include "axon/transfer/session.hpp"
 
 namespace axon {
 
 struct ServerConfig {
     // A client that sends nothing (or stops reading) for this long is dropped.
     std::chrono::milliseconds idle_timeout{std::chrono::seconds{60}};
+    // A session no connection has used for this long can no longer be resumed.
+    std::chrono::milliseconds session_ttl{std::chrono::minutes{10}};
+};
+
+// Totals over sessions that finished (the client sent ACK).
+struct ServerStats {
+    std::uint64_t sessions_finished = 0;
+    std::uint64_t payload_bytes = 0;    // file bytes sent
+    std::uint64_t redundant_bytes = 0;  // of those, bytes the same session was sent before
 };
 
 // Serves a Dataset over TCP with one thread per connection.
@@ -34,6 +45,7 @@ public:
     void stop() noexcept;
 
     [[nodiscard]] std::uint16_t port() const { return listener_.local_port(); }
+    [[nodiscard]] ServerStats stats() const;
 
 private:
     struct Conn {
@@ -45,12 +57,18 @@ private:
 
     void spawn(Socket sock);
     void serve(Conn& conn);  // runs on the connection's thread
-    void reap();             // joins connections whose thread has finished
+    void serve_client(Socket& sock, const std::string& who);
+    void finish(const Session& session, const std::string& who);
+    void reap();  // joins connections whose thread has finished
     void close_all() noexcept;
 
     Dataset dataset_;
     Listener listener_;
     ServerConfig config_;
+    SessionTable sessions_;  // after dataset_: sessions point into it
+    std::atomic<std::uint64_t> sessions_finished_{0};
+    std::atomic<std::uint64_t> payload_bytes_{0};
+    std::atomic<std::uint64_t> redundant_bytes_{0};
     Fd wake_;  // eventfd that stop() writes to wake poll()
     std::atomic<bool> stopping_{false};
     std::mutex mu_;          // guards conns_ and next_id_
