@@ -133,6 +133,12 @@ done
 [[ -z $(find "$OUT" -name '.axon-*') ]] || fail "temporary files left behind after faults"
 cuts=$(grep -c "fault injection cut the connection" "$WORK/server.log" || true)
 [[ $cuts -ge 3 ]] || fail "expected several injected cuts, saw $cuts"
+# Every byte that got through a cut was kept, so no session was sent anything twice.
+sessions=$(grep -c "session .* done:" "$WORK/server.log" || true)
+[[ $sessions == 2 ]] || fail "expected 2 finished sessions, saw $sessions"
+if grep "session .* done:" "$WORK/server.log" | grep -qv ", 0 resent,"; then
+    fail "a session was sent bytes twice: $(grep 'session .* done:' "$WORK/server.log")"
+fi
 stop_server
 
 echo "PASS ($cuts injected cuts survived)"
