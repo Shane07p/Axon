@@ -62,6 +62,11 @@ public:
     // thread is blocked in send_all/recv_all on this socket: that call returns.
     void shutdown() noexcept;
 
+    // Makes send and receive calls return at once instead of waiting (for an
+    // event loop using poll()). The *_all and recv_some helpers expect a
+    // blocking socket.
+    void set_nonblocking();
+
     [[nodiscard]] int fd() const noexcept { return fd_.get(); }
     explicit operator bool() const noexcept { return static_cast<bool>(fd_); }
 

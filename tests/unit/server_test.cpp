@@ -1,3 +1,5 @@
+#include <sys/socket.h>
+
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -244,6 +246,106 @@ TEST_F(ServerTest, AbandonedSessionExpires) {
     auto sock = connect();
     EXPECT_EQ(expect_err(sock, Get{.topic = "animals", .session_id = session}).code,
               ErrCode::SessionNotFound);
+}
+
+// --- the session event loop ---
+
+TEST_F(ServerTest, SlowReaderDoesNotStallTheSessionsOtherConnections) {
+    const std::string huge = pattern(20'000'000);
+    write_file(dir_ / "animals" / "huge.bin", huge);  // sorts last: file id 3
+    start();
+    auto stalled = connect();
+    const int tiny = 4096;
+    ::setsockopt(stalled.fd(), SOL_SOCKET, SO_RCVBUF, &tiny, sizeof tiny);
+    MessageReader r1;
+    const auto ok = std::get<Ok>(ask(stalled, r1, Get{.topic = "animals"}));
+    ASSERT_EQ(ok.files->at(3).name, "huge.bin");
+    send_message(stalled, Req{{{.file_id = 3, .offset = 0, .length = huge.size()}}});
+    // `stalled` never reads, so the server's buffers for it fill up and stay full.
+    const auto session = ok.session_id;
+
+    auto quick = connect();
+    MessageReader r2;
+    (void)ask(quick, r2, Get{.topic = "animals", .session_id = session});
+    const auto t0 = std::chrono::steady_clock::now();
+    send_message(quick, Req{{{.file_id = 0, .offset = 0, .length = big.size()}}});
+    EXPECT_EQ(receive(quick, r2, 0, 0, big.size()), big);
+    EXPECT_LT(std::chrono::steady_clock::now() - t0, 2s) << "served by the same thread, not blocked by it";
+
+    // And `stalled` really is stuck mid-file, not refused: its first frame is
+    // the start of huge.bin.
+    const auto first = r1.read(stalled);
+    ASSERT_TRUE(first.has_value());
+    ASSERT_TRUE(std::holds_alternative<Data>(*first));
+    EXPECT_EQ(std::get<Data>(*first).file_id, 3u);
+    EXPECT_EQ(std::get<Data>(*first).offset, 0u);
+    send_message(quick, Ack{});
+}
+
+TEST_F(ServerTest, PipelinedRequestsAreServedInOrder) {
+    start();
+    auto sock = connect();
+    MessageReader reader;
+    (void)ask(sock, reader, Get{.topic = "animals"});
+    send_message(sock, Req{{{.file_id = 1, .offset = 0, .length = 4}}});
+    send_message(sock, Req{{{.file_id = 0, .offset = 10, .length = 100'000}}});
+    EXPECT_EQ(receive(sock, reader, 1, 0, 4), "meow");
+    EXPECT_EQ(receive(sock, reader, 0, 10, 100'000), big.substr(10, 100'000));
+}
+
+TEST_F(ServerTest, ErrorQueuedBehindDataArrivesAfterIt) {
+    start();
+    auto sock = connect();
+    MessageReader reader;
+    (void)ask(sock, reader, Get{.topic = "animals"});
+    send_message(sock, Req{{{.file_id = 0, .offset = 0, .length = big.size()},
+                            {.file_id = 1, .offset = 0, .length = 99}}});  // cat.txt is 4 bytes
+    EXPECT_EQ(receive(sock, reader, 0, 0, big.size()), big) << "the good range comes first, whole";
+    const auto reply = reader.read(sock);
+    ASSERT_TRUE(reply.has_value());
+    ASSERT_TRUE(std::holds_alternative<Err>(*reply));
+    EXPECT_EQ(std::get<Err>(*reply).code, ErrCode::BadRange);
+    EXPECT_FALSE(reader.read(sock).has_value()) << "then the connection closes";
+}
+
+TEST_F(ServerTest, GarbageMidStreamIsAnsweredAfterTheFrameInFlight) {
+    const std::string huge = pattern(5'000'000);
+    write_file(dir_ / "animals" / "huge.bin", huge);  // file id 3
+    start();
+    auto sock = connect();
+    MessageReader reader;
+    (void)ask(sock, reader, Get{.topic = "animals"});
+    send_message(sock, Req{{{.file_id = 3, .offset = 0, .length = huge.size()}}});
+    std::array<std::byte, frame_header_len> garbage{};
+    axon::store_be(std::span{garbage}.first<4>(), tag("NOPE"));
+    sock.send_all(garbage);  // arrives while DATA is streaming
+
+    // Whatever DATA came first is whole and in order; then ERR; then the end.
+    std::uint64_t at = 0;
+    for (;;) {
+        const auto msg = reader.read(sock);
+        ASSERT_TRUE(msg.has_value()) << "expected ERR before the end";
+        if (const auto* d = std::get_if<Data>(&*msg)) {
+            ASSERT_EQ(d->offset, at);
+            ASSERT_TRUE(std::ranges::equal(d->bytes, std::as_bytes(std::span{huge}.subspan(at, d->bytes.size()))));
+            at += d->bytes.size();
+            continue;
+        }
+        ASSERT_TRUE(std::holds_alternative<Err>(*msg));
+        EXPECT_EQ(std::get<Err>(*msg).code, ErrCode::BadRequest);
+        break;
+    }
+    EXPECT_FALSE(reader.read(sock).has_value());
+}
+
+TEST_F(ServerTest, ConnectionIdleAfterItsHandshakeIsDropped) {
+    start({.idle_timeout = 200ms});
+    auto sock = connect();
+    MessageReader reader;
+    (void)ask(sock, reader, Get{.topic = "animals"});  // then silence
+    const auto t0 = std::chrono::steady_clock::now();
+    EXPECT_FALSE(reader.read(sock).has_value());
+    EXPECT_GE(std::chrono::steady_clock::now() - t0, 150ms);
 }
 
 // --- fault injection ---

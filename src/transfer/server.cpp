@@ -9,18 +9,16 @@
 #include <cerrno>
 #include <format>
 #include <iterator>
-#include <span>
 #include <stdexcept>
 #include <string>
 #include <utility>
-#include <vector>
 
 #include "axon/fault/fault.hpp"
 #include "axon/log.hpp"
 #include "axon/protocol/bytes.hpp"
 #include "axon/protocol/frame.hpp"
-#include "axon/storage/file.hpp"
 #include "sys_error.hpp"
+#include "transfer/session_worker.hpp"
 
 namespace axon {
 namespace {
@@ -29,7 +27,7 @@ using namespace proto;
 
 static_assert(std::atomic<bool>::is_always_lock_free, "stop() must be async-signal-safe");
 
-// GET and REQ are a few hundred bytes; anything far bigger is not a client.
+// GET and LIST are a few hundred bytes; anything far bigger is not a client.
 constexpr std::size_t max_request_len = 4096;
 
 // A request the server refuses: sent to the client as Err, then the
@@ -41,61 +39,6 @@ public:
 };
 
 [[noreturn]] void reject(ErrCode code, const std::string& reason) { throw Rejection{code, reason}; }
-
-// Fault injection cut the connection on purpose.
-class InjectedCut : public std::runtime_error {
-public:
-    explicit InjectedCut(std::uint64_t at)
-        : std::runtime_error{std::format("fault injection cut the connection after {} file bytes", at)} {}
-};
-
-// Streams one requested range as DATA frames, recording them in `session`.
-// When `fault` says so, the last frame is cut short and InjectedCut thrown.
-void send_range(Socket& sock, Session& session, const Range& r, std::vector<std::byte>& buf,
-                FaultPlan& fault) {
-    const Topic& topic = session.topic();
-    if (r.file_id >= topic.files.size()) {
-        reject(ErrCode::BadRange, std::format("no file with id {}", r.file_id));
-    }
-    const FileEntry& entry = topic.files[r.file_id];
-    if (r.offset + r.length > entry.size) {
-        reject(ErrCode::BadRange, std::format("{} bytes at offset {} run past the end of {} ({} bytes)",
-                                              r.length, r.offset, entry.name, entry.size));
-    }
-    // File errors are logged in full here; the client only learns which file.
-    File file;
-    try {
-        file = File::open_read(topic.file_path(r.file_id));
-    } catch (const std::system_error& e) {
-        log_msg("cannot serve file: {}", e.what());
-        reject(ErrCode::Internal, std::format("cannot read {}", entry.name));
-    }
-    const std::uint64_t end = r.offset + r.length;
-    for (std::uint64_t pos = r.offset; pos < end;) {
-        const auto want = static_cast<std::size_t>(std::min<std::uint64_t>(buf.size(), end - pos));
-        std::size_t n = 0;
-        try {
-            n = file.read_at(std::span{buf}.first(want), pos);
-        } catch (const std::system_error& e) {
-            log_msg("cannot serve file: {}", e.what());
-            reject(ErrCode::Internal, std::format("cannot read {}", entry.name));
-        }
-        if (n == 0) {
-            reject(ErrCode::Internal, std::format("{} shrank since the server started", entry.name));
-        }
-        const Data data{.file_id = r.file_id, .offset = pos, .bytes = std::span{buf}.first(n)};
-        if (const std::size_t allowed = fault.allow(n); allowed < n) {
-            // The header announces all n bytes; only `allowed` of them follow.
-            send_truncated(sock, data, data_header_len + allowed);
-            session.record_sent(r.file_id, pos, allowed);
-            throw InjectedCut{fault.cut_at()};
-        }
-        send_message(sock, data);
-        session.record_sent(r.file_id, pos, n);
-        fault.sent(n);
-        pos += n;
-    }
-}
 
 void check_version(std::uint16_t version) {
     if (version != protocol_version) {
@@ -139,9 +82,11 @@ ServerStats Server::stats() const {
             .redundant_bytes = redundant_bytes_.load()};
 }
 
-// One client: LIST -> TOPS, or GET -> OK, then REQ ... (answered with DATA)
-// until ACK. A GET with a session id resumes that session.
-void Server::serve_client(Socket& sock, std::uint64_t conn_id, const std::string& who) {
+// LIST is answered here. GET opens or resumes a session, is answered with OK,
+// and the connection is then handed to the session's worker for REQ, DATA
+// and ACK.
+void Server::handshake(Conn& conn, const std::string& who) {
+    Socket& sock = conn.sock;
     MessageReader reader{max_request_len};
     const auto first = reader.read(sock);
     if (!first) {
@@ -189,22 +134,38 @@ void Server::serve_client(Socket& sock, std::uint64_t conn_id, const std::string
     send_message(sock, ok);
     // Like the C version: each of the client's connections carries about 1/n of
     // what is left, so the cut point is drawn over that share.
-    FaultPlan fault{config_.fault, conn_id, session->bytes_left() / get->connections};
+    hand_off(session, detail::Stream{
+                          .id = conn.id,
+                          .sock = take_socket(conn),
+                          .fault = FaultPlan{config_.fault, conn.id,
+                                             session->bytes_left() / get->connections}});
+}
 
-    std::vector<std::byte> buf(max_data_len);
-    while (const auto msg = reader.read(sock)) {
-        if (const auto* req = std::get_if<Req>(&*msg)) {
-            for (const Range& r : req->ranges) {
-                send_range(sock, *session, r, buf, fault);
-            }
-        } else if (std::holds_alternative<Ack>(*msg)) {
-            finish(*session, who);
-            return;
-        } else {
-            reject(ErrCode::BadRequest, "expected REQ or ACK");
-        }
+// Gives the connection to its session's worker, starting one if there is
+// none (or the last one is just exiting).
+void Server::hand_off(const std::shared_ptr<Session>& session, detail::Stream stream) {
+    const std::lock_guard lock{workers_mu_};
+    if (stopping_.load()) {
+        return;  // shutting down: the stream's socket just closes
     }
-    log_msg("{}: client left before ACK; session {:016x} kept for resume", who, session->id());
+    std::unique_ptr<detail::SessionWorker>& worker = workers_[session->id()];
+    if (worker && worker->add(stream)) {
+        return;
+    }
+    worker = std::make_unique<detail::SessionWorker>(
+        session,
+        detail::WorkerConfig{.idle_timeout = config_.idle_timeout,
+                             .on_finish = [this](const Session& s, const std::string& who) {
+                                 finish(s, who);
+                             }},
+        std::move(stream));
+}
+
+// Moves the socket out of `conn` under mu_, so close_all() never shuts a
+// socket while it changes hands.
+Socket Server::take_socket(Conn& conn) {
+    const std::lock_guard lock{mu_};
+    return std::move(conn.sock);
 }
 
 void Server::finish(const Session& session, const std::string& who) {
@@ -253,13 +214,13 @@ void Server::run() {
             std::this_thread::sleep_for(std::chrono::milliseconds{100});
         }
     }
-    std::size_t open = 0;
+    std::size_t sessions = 0;
     {
-        const std::lock_guard lock{mu_};
-        open = static_cast<std::size_t>(
-            std::ranges::count_if(conns_, [](const Conn& c) { return !c.done.load(); }));
+        const std::lock_guard lock{workers_mu_};
+        sessions = static_cast<std::size_t>(std::ranges::count_if(
+            workers_, [](const auto& entry) { return !entry.second->exited(); }));
     }
-    log_msg("stopping: closing {} connection(s)", open);
+    log_msg("stopping: closing {} active session(s)", sessions);
     listener_ = Listener{};  // clients still in the accept queue get a reset, not a hang
     close_all();
 }
@@ -284,9 +245,7 @@ void Server::serve(Conn& conn) {
     const std::string who = std::format("conn {}", conn.id);
     try {
         conn.sock.set_timeouts(config_.idle_timeout);
-        serve_client(conn.sock, conn.id, who);
-    } catch (const InjectedCut& e) {
-        log_msg("{}: {}", who, e.what());
+        handshake(conn, who);
     } catch (const Rejection& r) {
         log_msg("{}: refused, {}: {}", who, proto::to_string(r.code), r.what());
         try {
@@ -305,7 +264,8 @@ void Server::serve(Conn& conn) {
             log_msg("{}: dropped: {}", who, e.what());
         }
     }
-    conn.sock.shutdown();  // the client sees EOF now; the fd closes when the Conn is reaped
+    const std::lock_guard lock{mu_};
+    conn.sock.shutdown();  // (unless handed off) the client sees EOF now; the fd closes on reap
 }
 
 void Server::reap() {
@@ -320,19 +280,41 @@ void Server::reap() {
             it = next;
         }
     }
-    // `finished` is destroyed here: each thread has returned, so joining is instant.
+    finished.clear();  // each thread has returned, so joining is instant
+
+    std::vector<std::unique_ptr<detail::SessionWorker>> exited;
+    {
+        const std::lock_guard lock{workers_mu_};
+        for (auto it = workers_.begin(); it != workers_.end();) {
+            if (it->second->exited()) {
+                exited.push_back(std::move(it->second));
+                it = workers_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    // `exited` is destroyed here, outside the lock: each thread has returned.
 }
 
 void Server::close_all() noexcept {
+    // Handshake threads first, so none hands a connection over afterwards.
     std::list<Conn> all;
     {
         const std::lock_guard lock{mu_};
         all.splice(all.end(), conns_);
+        for (Conn& conn : all) {
+            conn.sock.shutdown();  // wakes a thread blocked in recv or send
+        }
     }
-    for (Conn& conn : all) {
-        conn.sock.shutdown();  // wakes a thread blocked in recv or send
+    all.clear();  // each jthread joins, then its socket closes
+
+    std::unordered_map<std::uint64_t, std::unique_ptr<detail::SessionWorker>> workers;
+    {
+        const std::lock_guard lock{workers_mu_};
+        workers.swap(workers_);
     }
-    // `all` is destroyed here: each jthread joins, then its socket closes.
+    workers.clear();  // each worker closes its connections and joins
 }
 
 }  // namespace axon

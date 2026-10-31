@@ -25,6 +25,14 @@ void send_message(Socket& sock, const Message& msg) {
     sock.send_all(frame_header(msg, payload.size()), payload);
 }
 
+std::vector<std::byte> encode_frame(const Message& msg) {
+    const auto payload = encode(msg);
+    const auto header = frame_header(msg, payload.size());
+    std::vector<std::byte> frame(header.begin(), header.end());
+    frame.insert(frame.end(), payload.begin(), payload.end());
+    return frame;
+}
+
 void send_truncated(Socket& sock, const Message& msg, std::size_t payload_bytes) {
     const auto payload = encode(msg);
     sock.send_all(frame_header(msg, payload.size()),

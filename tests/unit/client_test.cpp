@@ -406,7 +406,10 @@ TEST_F(FetchTest, ParallelDownloadsGiveIdenticalFiles) {
              .timeout = 5s});
         expect_identical("t");
         EXPECT_EQ(stats.bytes, total);
-        EXPECT_EQ(stats.connections, n) << "each connection joins once when nothing fails";
+        // A connection that starts after the others finished everything never
+        // connects at all, so this is at most n; the hand-over test below
+        // pins down real parallel use.
+        EXPECT_LE(stats.connections, n) << "each connection joins at most once when nothing fails";
         server.stop();
         EXPECT_EQ(server.stats().sessions_finished, 1u);
         EXPECT_EQ(server.stats().redundant_bytes, 0u);
@@ -435,11 +438,14 @@ TEST_F(FetchTest, ParallelDownloadSurvivesFrequentCuts) {
 }
 
 TEST_F(FetchTest, ConnectionThatIsCutHandsItsFileToAnother) {
-    const std::vector<std::string> content{patterned(300'000), patterned(20'000)};
+    // Both files span several frames, so whichever one the first connection
+    // asks for (that depends on thread timing) can be cut mid-frame.
+    const std::vector<std::string> content{patterned(300'000), patterned(200'000)};
     const std::vector<FileEntry> files{{"big.bin", content[0].size(), crc_of(content[0])},
                                        {"small.bin", content[1].size(), crc_of(content[1])}};
     std::vector<Req> on_second;  // what the second connection was asked for
     std::array<std::uint16_t, 2> hints{};
+    std::uint32_t cut_file = 99;
     {
         const FakeServer server{
             [&](Socket& sock, int i) {
@@ -447,14 +453,14 @@ TEST_F(FetchTest, ConnectionThatIsCutHandsItsFileToAnother) {
                 hints[static_cast<std::size_t>(i)] = std::get<Get>(*reader.read(sock)).connections;
                 send_message(sock, Ok{.session_id = 7, .files = i == 0 ? std::optional{files}
                                                                        : std::nullopt});
-                if (i == 0) {  // takes big.bin, then is cut 1000 bytes into its second frame
+                if (i == 0) {  // cut 1000 bytes into the second frame of whatever it asked for
                     const auto req = std::get<Req>(*reader.read(sock));
-                    EXPECT_EQ(req.ranges.at(0).file_id, 0u);
-                    send_frames(sock, content[0], 0, 1);
-                    const Data second{.file_id = 0,
+                    cut_file = req.ranges.at(0).file_id;
+                    const std::string_view file{content[cut_file]};
+                    send_frames(sock, file, 0, 1, cut_file);
+                    const Data second{.file_id = cut_file,
                                       .offset = max_data_len,
-                                      .bytes = bytes(std::string_view{content[0]}.substr(max_data_len,
-                                                                                         max_data_len))};
+                                      .bytes = bytes(file.substr(max_data_len, max_data_len))};
                     send_truncated(sock, second, data_header_len + 1000);
                     return;
                 }
@@ -470,8 +476,8 @@ TEST_F(FetchTest, ConnectionThatIsCutHandsItsFileToAnother) {
                 }
             },
             2};
-        // The cut connection backs off for seconds, so the other one takes
-        // big.bin over long before it could; it wakes as soon as all is done.
+        // The cut connection backs off for seconds, so the other one takes its
+        // file over long before it could; it wakes as soon as all is done.
         const auto t0 = std::chrono::steady_clock::now();
         const FetchStats stats = axon::fetch({.host = "127.0.0.1",
                                               .port = server.port(),
@@ -485,11 +491,12 @@ TEST_F(FetchTest, ConnectionThatIsCutHandsItsFileToAnother) {
     }
     EXPECT_EQ(read_file(out() / "t" / "big.bin"), content[0]);
     EXPECT_EQ(read_file(out() / "t" / "small.bin"), content[1]);
-    // Whether it fetched small.bin first depends on timing; either way the
-    // second connection asked for big.bin from the exact byte the first had.
+    // In whatever order things happened, the second connection asked for the
+    // cut file from the exact byte the first one had.
+    ASSERT_LT(cut_file, 2u);
     const auto took_over = std::ranges::find_if(
-        on_second, [](const Req& r) { return r.ranges.at(0).file_id == 0; });
-    ASSERT_NE(took_over, on_second.end()) << "the second connection took big.bin over";
+        on_second, [&](const Req& r) { return r.ranges.at(0).file_id == cut_file; });
+    ASSERT_NE(took_over, on_second.end()) << "the second connection took the cut file over";
     EXPECT_EQ(took_over->ranges.at(0).offset, max_data_len + 1000) << "at its exact byte";
     EXPECT_EQ(hints, (std::array<std::uint16_t, 2>{2, 2})) << "each GET says how many connections share";
 }
@@ -500,7 +507,7 @@ TEST_F(FetchTest, NoMoreConnectionsThanFiles) {
     LiveServer server{data()};
     const FetchStats stats = axon::fetch(
         {.host = "127.0.0.1", .port = server.port(), .topic = "t", .output = out(), .connections = 8});
-    EXPECT_EQ(stats.connections, 2u);
+    EXPECT_LE(stats.connections, 2u) << "never more connections than files";
     expect_identical("t");
 }
 

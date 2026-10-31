@@ -49,6 +49,7 @@ add_library(axon_core
     src/transfer/client.cpp
     src/transfer/server.cpp
     src/transfer/session.cpp
+    src/transfer/session_worker.cpp
     src/version.cpp)
 target_include_directories(axon_core PUBLIC include PRIVATE src)
 target_compile_definitions(axon_core PRIVATE AXON_VERSION="${PROJECT_VERSION}")

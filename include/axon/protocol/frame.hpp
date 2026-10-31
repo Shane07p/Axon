@@ -17,6 +17,10 @@ inline constexpr std::size_t default_max_payload = 16 * 1024 * 1024;
 // Encodes `msg` and sends it as one frame.
 void send_message(Socket& sock, const Message& msg);
 
+// The whole frame for `msg`, header and payload, for code that writes it
+// itself (a non-blocking event loop).
+[[nodiscard]] std::vector<std::byte> encode_frame(const Message& msg);
+
 // Sends a frame whose header announces all of `msg` but which carries only
 // its first `payload_bytes` bytes: a deliberately cut frame, for fault
 // injection.

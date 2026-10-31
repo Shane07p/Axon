@@ -1,6 +1,7 @@
 #include "axon/net/socket.hpp"
 
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <poll.h>
@@ -123,6 +124,13 @@ void Socket::set_timeouts(std::chrono::milliseconds t) {
 }
 
 void Socket::shutdown() noexcept { ::shutdown(fd(), SHUT_RDWR); }
+
+void Socket::set_nonblocking() {
+    const int flags = ::fcntl(fd(), F_GETFL);
+    if (flags < 0 || ::fcntl(fd(), F_SETFL, flags | O_NONBLOCK) < 0) {
+        detail::throw_errno<NetworkError>("fcntl O_NONBLOCK");
+    }
+}
 
 Listener Listener::listen(const std::string& address, std::uint16_t port) {
     const std::string where = address + ":" + std::to_string(port);

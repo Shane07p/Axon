@@ -4,9 +4,11 @@
 #include <chrono>
 #include <cstdint>
 #include <list>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 
 #include "axon/fault/fault.hpp"
 #include "axon/fd.hpp"
@@ -15,6 +17,11 @@
 #include "axon/transfer/session.hpp"
 
 namespace axon {
+
+namespace detail {
+class SessionWorker;
+struct Stream;
+}  // namespace detail
 
 struct ServerConfig {
     // A client that sends nothing (or stops reading) for this long is dropped.
@@ -32,7 +39,9 @@ struct ServerStats {
     std::uint64_t redundant_bytes = 0;  // of those, bytes the same session was sent before
 };
 
-// Serves a Dataset over TCP with one thread per connection.
+// Serves a Dataset over TCP. Each new connection gets a short-lived thread
+// for its handshake (GET or LIST); a download's connections are then served
+// together by one thread per session, with poll() and non-blocking sockets.
 class Server {
 public:
     Server(Dataset dataset, Listener listener, ServerConfig config = {});
@@ -61,9 +70,11 @@ private:
 
     void spawn(Socket sock);
     void serve(Conn& conn);  // runs on the connection's thread
-    void serve_client(Socket& sock, std::uint64_t conn_id, const std::string& who);
+    void handshake(Conn& conn, const std::string& who);
+    void hand_off(const std::shared_ptr<Session>& session, detail::Stream stream);
+    Socket take_socket(Conn& conn);
     void finish(const Session& session, const std::string& who);
-    void reap();  // joins connections whose thread has finished
+    void reap();  // joins finished handshake threads and session workers
     void close_all() noexcept;
 
     Dataset dataset_;
@@ -76,9 +87,11 @@ private:
     std::atomic<std::uint64_t> redundant_bytes_{0};
     Fd wake_;  // eventfd that stop() writes to wake poll()
     std::atomic<bool> stopping_{false};
-    std::mutex mu_;          // guards conns_ and next_id_
+    std::mutex mu_;          // guards conns_, next_id_ and each Conn's sock
     std::list<Conn> conns_;  // a list, so a Conn never moves while its thread runs
     std::uint64_t next_id_ = 1;
+    std::mutex workers_mu_;  // guards workers_
+    std::unordered_map<std::uint64_t, std::unique_ptr<detail::SessionWorker>> workers_;  // by session id
 };
 
 }  // namespace axon

@@ -94,6 +94,6 @@ include/axon/    public headers of the core library
 src/net/         sockets
 src/protocol/    message encoding and framing
 src/storage/     files and the dataset scanner
-src/transfer/    server and client
+src/transfer/    server (one poll() loop per session) and client
 tests/unit/      GoogleTest unit tests
 ```
