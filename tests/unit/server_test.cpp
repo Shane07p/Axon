@@ -134,7 +134,8 @@ TEST_F(ServerTest, ServesListAndRangesUntilAck) {
     MessageReader reader;
     const auto ok = std::get<Ok>(ask(sock, reader, Get{.topic = "animals"}));
     EXPECT_EQ(ok.files, Dataset::scan(dir_).find("animals")->files);
-    ASSERT_EQ(ok.files->size(), 3u);
+    ASSERT_TRUE(ok.files.has_value());
+    ASSERT_EQ(ok.files.value().size(), 3u);
     ASSERT_EQ((*ok.files)[0].name, "big.bin");
 
     send_message(sock, Req{{{.file_id = 0, .offset = 0, .length = big.size()}}});
@@ -259,7 +260,8 @@ TEST_F(ServerTest, SlowReaderDoesNotStallTheSessionsOtherConnections) {
     ::setsockopt(stalled.fd(), SOL_SOCKET, SO_RCVBUF, &tiny, sizeof tiny);
     MessageReader r1;
     const auto ok = std::get<Ok>(ask(stalled, r1, Get{.topic = "animals"}));
-    ASSERT_EQ(ok.files->at(3).name, "huge.bin");
+    ASSERT_TRUE(ok.files.has_value());
+    ASSERT_EQ(ok.files.value().at(3).name, "huge.bin");
     send_message(stalled, Req{{{.file_id = 3, .offset = 0, .length = huge.size()}}});
     // `stalled` never reads, so the server's buffers for it fill up and stay full.
     const auto session = ok.session_id;
