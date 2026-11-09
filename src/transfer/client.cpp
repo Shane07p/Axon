@@ -59,10 +59,6 @@ Message next(Socket& sock, MessageReader& reader) {
     return std::move(*msg);
 }
 
-fs::path temp_path(const fs::path& dir, std::size_t id) {
-    return dir / std::format(".axon-{}.part", id);
-}
-
 // When one connection retries: exponential backoff with jitter, and a limit
 // on attempts in a row that make no progress.
 class Backoff {
@@ -122,6 +118,7 @@ private:
     };
 
     Link open_session();  // a new session; retried once a session was lost
+    void adopt(const std::vector<FileEntry>& files);
     Link connect(const Get& get);
     void work(Link first);
     void worker(std::size_t index, std::optional<Link> link);
@@ -150,6 +147,7 @@ private:
     const std::uint64_t seed_;
     bool connected_once_ = false;  // only touched before the workers start
     std::atomic<std::size_t> connections_{0};
+    std::atomic<std::uint64_t> received_{0};
 
     // Set while no worker runs, read-only while they do.
     std::uint64_t session_ = 0;
@@ -182,9 +180,10 @@ FetchStats Download::run() {
         if (!session_lost_) {
             std::rethrow_exception(last_error_);  // every connection gave up
         }
-        reset();  // the server forgot the session: start over
+        reset();  // the server forgot the session: open a new one
     }
-    FetchStats stats{.files = files_.size(), .connections = connections_.load()};
+    FetchStats stats{
+        .files = files_.size(), .received = received_.load(), .connections = connections_.load()};
     for (const FileEntry& f : files_) {
         stats.bytes += f.size;
     }
@@ -213,12 +212,8 @@ Download::Link Download::open_session() {
                 protocol_error("expected OK with the file list");
             }
             session_ = ok->session_id;
-            files_ = *ok->files;
-            progress_ = std::vector<FileProgress>(files_.size());
-            for (std::uint32_t id = 0; id < files_.size(); ++id) {
-                todo_.push_back(id);
-            }
             fs::create_directories(dir_);
+            adopt(*ok->files);
             return link;
         } catch (const NetworkError&) {
             if (!connected_once_ || !backoff.failed(false)) {
@@ -230,6 +225,36 @@ Download::Link Download::open_session() {
             }
         }
         std::this_thread::sleep_for(backoff.next_wait());
+    }
+}
+
+// Takes the file list of a new session. A file listed with the same name,
+// size and CRC-32 as before keeps its progress (a finished file stays
+// finished); any other starts from scratch. Unfinished files that are no
+// longer listed lose their temporary file.
+void Download::adopt(const std::vector<FileEntry>& files) {
+    std::vector<FileProgress> progress(files.size());
+    for (std::size_t old = 0; old < files_.size(); ++old) {
+        const auto same = std::ranges::find(files, files_[old]);
+        if (same != files.end()) {
+            progress[static_cast<std::size_t>(same - files.begin())] = std::move(progress_[old]);
+        } else if (progress_[old].state != FileState::Done) {
+            progress_[old].part = File{};
+            std::error_code ec;
+            fs::remove(temp_path(dir_, files_[old].name), ec);
+        }
+    }
+    files_ = files;
+    progress_ = std::move(progress);
+    todo_.clear();
+    done_ = 0;
+    for (std::uint32_t id = 0; id < files_.size(); ++id) {
+        if (progress_[id].state == FileState::Done) {
+            ++done_;
+        } else {
+            progress_[id].state = FileState::Todo;
+            todo_.push_back(id);
+        }
     }
 }
 
@@ -351,7 +376,7 @@ void Download::receive_rest(Link& link, std::uint32_t id, std::uint64_t& receive
                             std::vector<std::byte>& buf) {
     FileProgress& p = progress_[id];
     const FileEntry& entry = files_[id];
-    const fs::path part = temp_path(dir_, id);
+    const fs::path part = temp_path(dir_, entry.name);
     if (!p.part) {
         p.part = File::open_write(part);
         p.part.truncate(p.got);  // p.got is 0 here: drops a stale temp file from an earlier run
@@ -397,6 +422,7 @@ void Download::receive_rest(Link& link, std::uint32_t id, std::uint64_t& receive
             p.crc = crc32_update(p.crc, piece);
             p.got += n;
             received += n;
+            received_.fetch_add(n, std::memory_order_relaxed);
             left -= n;
         }
     }
@@ -504,12 +530,9 @@ void Download::track(Socket* sock, bool live) {
     }
 }
 
+// After a lost session; files_ and progress_ stay for adopt() to reuse.
 void Download::reset() {
     session_ = 0;
-    files_.clear();
-    progress_.clear();
-    todo_.clear();
-    done_ = 0;
     live_.clear();
     aborted_ = false;
     session_lost_ = false;
@@ -522,6 +545,14 @@ void Download::reset() {
 ServerError::ServerError(ErrCode c, const std::string& reason)
     : std::runtime_error{std::format("server refused: {}: {}", to_string(c), printable(reason))},
       code{c} {}
+
+fs::path temp_path(const fs::path& dir, std::string_view name) {
+    std::uint64_t hash = 0xcbf29ce484222325;  // FNV-1a
+    for (const char c : name) {
+        hash = (hash ^ static_cast<unsigned char>(c)) * 0x100000001b3;
+    }
+    return dir / std::format(".axon-{:016x}.part", hash);
+}
 
 FetchStats fetch(const FetchRequest& req) {
     if (!is_valid_topic(req.topic)) {

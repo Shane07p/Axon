@@ -2,18 +2,20 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <exception>
 #include <filesystem>
 #include <format>
 #include <fstream>
-#include <iterator>
 #include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -36,9 +38,16 @@ using axon::test::FakeServer;
 using axon::test::LiveServer;
 using axon::test::write_file;
 
+// The whole file; empty if it does not exist.
 std::string read_file(const fs::path& p) {
-    std::ifstream in{p, std::ios::binary};
-    return {std::istreambuf_iterator<char>{in}, std::istreambuf_iterator<char>{}};
+    std::error_code ec;
+    const auto size = fs::file_size(p, ec);
+    if (ec) {
+        return {};
+    }
+    std::string s(size, '\0');
+    std::ifstream{p, std::ios::binary}.read(s.data(), static_cast<std::streamsize>(size));
+    return s;
 }
 
 std::vector<std::string> listing(const fs::path& dir) {
@@ -119,7 +128,7 @@ TEST_F(FetchTest, RefetchReplacesFilesAndLeavesOthersAlone) {
 
 TEST_F(FetchTest, StaleTemporaryFileIsOverwritten) {
     write_file(data() / "t" / "a.txt", "short");
-    write_file(out() / "t" / ".axon-0.part", std::string(100'000, 'x'));
+    write_file(axon::temp_path(out() / "t", "a.txt"), std::string(100'000, 'x'));
     LiveServer server{data()};
     (void)fetch_from(server.port(), "t");
     expect_identical("t");
@@ -302,44 +311,139 @@ TEST_F(FetchTest, ResumesAfterAConnectionReset) {
     EXPECT_EQ(read_file(out() / "t" / "x.bin"), content);
 }
 
-TEST_F(FetchTest, ForgottenSessionStartsOver) {
-    static constexpr std::string_view content = "abcdef";
-    const FileEntry entry{"x.txt", content.size(), crc_of(content)};
-    std::vector<Get> gets(3);
+struct Named {
+    std::string name;
+    std::string content;
+};
+
+struct AfterLoss {
+    std::vector<Get> gets;     // the GET of each connection
+    std::vector<Range> asked;  // what the client asked of the new session
+    FetchStats stats;
+};
+
+// The first session delivers a.txt whole and half of b.txt, then the server
+// forgets it (restarted, say); the new session lists `now`.
+AfterLoss after_lost_session(const fs::path& out, const std::string& topic, const std::vector<Named>& now) {
+    const auto entries = [](const std::vector<Named>& files) {
+        std::vector<FileEntry> list;
+        for (const Named& f : files) {
+            list.push_back({f.name, f.content.size(), crc_of(f.content)});
+        }
+        return list;
+    };
+    AfterLoss r{.gets = std::vector<Get>(3), .asked = {}, .stats = {}};
     {
         const FakeServer server{
             [&](Socket& sock, int i) {
                 MessageReader reader;
-                gets[static_cast<std::size_t>(i)] = std::get<Get>(*reader.read(sock));
-                if (i == 1) {  // the server lost the session in between
-                    send_message(sock, Err{.code = ErrCode::SessionNotFound, .reason = "expired"});
+                r.gets[static_cast<std::size_t>(i)] = std::get<Get>(*reader.read(sock));
+                if (i == 0) {
+                    send_message(sock,
+                                 Ok{.session_id = 77, .files = entries({{"a.txt", "abcdef"}, {"b.txt", "ghijkl"}})});
+                    (void)reader.read(sock);  // REQ
+                    send_message(sock, Data{.file_id = 0, .offset = 0, .bytes = bytes("abcdef")});
+                    send_message(sock, Data{.file_id = 1, .offset = 0, .bytes = bytes("ghi")});
+                    return;  // hang up
+                }
+                if (i == 1) {
+                    send_message(sock, Err{.code = ErrCode::SessionNotFound, .reason = "restarted"});
                     return;
                 }
-                send_message(sock, Ok{.session_id = i == 0 ? 77u : 88u,
-                                      .files = std::vector<FileEntry>{entry}});
-                const auto req = std::get<Req>(*reader.read(sock));
-                const auto bytes_from = [&](std::size_t n) { return bytes(content.substr(0, n)); };
-                if (i == 0) {
-                    send_message(sock, Data{.file_id = 0, .offset = 0, .bytes = bytes_from(3)});
-                    return;  // hang up half-way
+                send_message(sock, Ok{.session_id = 88, .files = entries(now)});
+                while (const auto msg = reader.read(sock)) {
+                    if (std::holds_alternative<Ack>(*msg)) {
+                        return;
+                    }
+                    for (const Range& range : std::get<Req>(*msg).ranges) {
+                        r.asked.push_back(range);
+                        const std::string_view content = now.at(range.file_id).content;
+                        send_message(sock, Data{.file_id = range.file_id,
+                                                .offset = range.offset,
+                                                .bytes = bytes(content.substr(range.offset, range.length))});
+                    }
                 }
-                EXPECT_EQ(req.ranges.at(0).offset, 0u) << "a new session starts from scratch";
-                send_message(sock, Data{.file_id = 0, .offset = 0, .bytes = bytes_from(6)});
-                (void)reader.read(sock);  // ACK
             },
             3};
-        (void)axon::fetch({.host = "127.0.0.1",
-                           .port = server.port(),
-                           .topic = "t",
-                           .output = out(),
-                           .timeout = 5s,
-                           .retry = {.first_delay = 1ms, .max_delay = 1ms}});
+        r.stats = axon::fetch({.host = "127.0.0.1",
+                               .port = server.port(),
+                               .topic = topic,
+                               .output = out,
+                               .timeout = 5s,
+                               .retry = {.first_delay = 1ms, .max_delay = 1ms}});
     }
-    EXPECT_EQ(read_file(out() / "t" / "x.txt"), content);
-    EXPECT_EQ(gets[0].session_id, 0u);
-    EXPECT_EQ(gets[1].session_id, 77u) << "the client tries to resume first";
-    EXPECT_EQ(gets[2].session_id, 0u);
-    EXPECT_TRUE(gets[2].want_list);
+    return r;
+}
+
+TEST_F(FetchTest, NewSessionKeepsWhatArrivedOfUnchangedFiles) {
+    const auto same = after_lost_session(out(), "same", {{"a.txt", "abcdef"}, {"b.txt", "ghijkl"}});
+    EXPECT_EQ(same.gets[1].session_id, 77u) << "the client tries to resume first";
+    EXPECT_EQ(same.gets[2].session_id, 0u);
+    EXPECT_TRUE(same.gets[2].want_list);
+    EXPECT_EQ(same.asked, (std::vector<Range>{{.file_id = 1, .offset = 3, .length = 3}}))
+        << "a.txt is done, b.txt continues where it stopped";
+    EXPECT_EQ(same.stats.received, same.stats.bytes) << "no byte came twice";
+    EXPECT_EQ(read_file(out() / "same" / "a.txt"), "abcdef");
+    EXPECT_EQ(read_file(out() / "same" / "b.txt"), "ghijkl");
+
+    // A new file sorts first: the others keep their progress under new ids.
+    const auto shifted =
+        after_lost_session(out(), "shifted", {{"0.txt", "new"}, {"a.txt", "abcdef"}, {"b.txt", "ghijkl"}});
+    EXPECT_EQ(shifted.asked, (std::vector<Range>{{.file_id = 0, .offset = 0, .length = 3},
+                                                 {.file_id = 2, .offset = 3, .length = 3}}));
+    EXPECT_EQ(read_file(out() / "shifted" / "b.txt"), "ghijkl");
+}
+
+TEST_F(FetchTest, NewSessionStartsChangedFilesOver) {
+    const auto changed = after_lost_session(out(), "changed", {{"a.txt", "abcdef"}, {"b.txt", "GHIJKL"}});
+    EXPECT_EQ(changed.asked, (std::vector<Range>{{.file_id = 1, .offset = 0, .length = 6}}));
+    EXPECT_EQ(read_file(out() / "changed" / "b.txt"), "GHIJKL");
+
+    // b.txt is gone from the server: its temporary file goes too.
+    const auto gone = after_lost_session(out(), "gone", {{"a.txt", "abcdef"}});
+    EXPECT_TRUE(gone.asked.empty());
+    EXPECT_EQ(listing(out() / "gone"), std::vector<std::string>{"a.txt"});
+}
+
+TEST_F(FetchTest, ServerRestartMidDownloadKeepsWhatArrived) {
+    const std::string content = patterned(8'000'000);
+    for (int i = 0; i < 4; ++i) {
+        write_file(data() / "t" / std::format("f{}", i), content);
+    }
+    std::optional<LiveServer> server{std::in_place, data()};
+    const std::uint16_t port = server->port();
+    FetchStats stats;
+    std::exception_ptr error;
+    std::atomic<bool> ended = false;
+    std::jthread client{[&] {
+        try {
+            stats = axon::fetch({.host = "127.0.0.1",
+                                 .port = port,
+                                 .topic = "t",
+                                 .output = out(),
+                                 .connections = 2,
+                                 .timeout = 5s,
+                                 // Enough tries to outlast the restart, slow under sanitizers.
+                                 .retry = {.max_failures = 100, .first_delay = 10ms, .max_delay = 100ms}});
+        } catch (...) {
+            error = std::current_exception();
+        }
+        ended = true;
+    }};
+    while (!fs::exists(out() / "t" / "f0") && !ended) {  // a quarter done, others partway
+        std::this_thread::sleep_for(1ms);
+    }
+    server.reset();
+    server.emplace(data(), axon::ServerConfig{.idle_timeout = 5s}, port);
+    client.join();
+    if (error) {
+        std::rethrow_exception(error);
+    }
+    expect_identical("t");
+    EXPECT_EQ(stats.received, stats.bytes) << "what arrived before the restart was not fetched again";
+    server->stop();
+    EXPECT_EQ(server->stats().sessions_finished, 1u) << "the download finished on the restarted server";
+    EXPECT_LT(server->stats().payload_bytes, stats.bytes);
 }
 
 TEST_F(FetchTest, GivesUpAfterAttemptsThatReceiveNothing) {
@@ -579,7 +683,7 @@ void serve_requests(Socket& sock, MessageReader& reader, const std::vector<std::
     }
 }
 
-TEST_F(FetchTest, SessionLostDuringAParallelDownloadStartsOver) {
+TEST_F(FetchTest, SessionLostDuringAParallelDownloadOpensANewOne) {
     const std::vector<std::string> content{patterned(100'000), patterned(50'000)};
     const std::vector<FileEntry> files{{"a.bin", content[0].size(), crc_of(content[0])},
                                        {"b.bin", content[1].size(), crc_of(content[1])}};

@@ -7,6 +7,7 @@
 #include <functional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "axon/protocol/messages.hpp"
@@ -57,13 +58,14 @@ struct FetchRequest {
 
 struct FetchStats {
     std::size_t files = 0;
-    std::uint64_t bytes = 0;
+    std::uint64_t bytes = 0;     // size of the topic
+    std::uint64_t received = 0;  // file bytes that came over the network
     std::size_t connections = 0;
     std::chrono::duration<double> elapsed{};
 };
 
 // Downloads every file of a topic into output/topic/, creating it if needed.
-// Each file is written to a temporary ".axon-<id>.part", checked against its
+// Each file is written to a temporary file (temp_path), checked against its
 // CRC-32, then renamed into place: a file under its real name is always
 // complete. Other files in the folder are left alone.
 //
@@ -73,14 +75,19 @@ struct FetchStats {
 // A connection lost part-way is resumed: its unfinished files go back to the
 // front of the queue (another connection may take them at once), and it
 // reconnects with backoff and rejoins the session. Every file continues from
-// the exact byte it has. If the server no longer knows the session, the
-// download starts over. The very first connect is not retried, so a wrong
-// address fails at once.
+// the exact byte it has. If the server no longer knows the session (it was
+// restarted, say), a new session is opened, and every file whose name, size
+// and CRC-32 are unchanged keeps what was already downloaded; the others start
+// over. The very first connect is not retried, so a wrong address fails at once.
 //
 // Throws std::invalid_argument for an invalid topic name, ServerError,
 // ProtocolError, IntegrityError, std::system_error for disk errors, and
 // NetworkError / ConnectionClosed once retrying gives up.
 FetchStats fetch(const FetchRequest& req);
+
+// Where fetch() writes file `name` of a topic before it is complete: a fixed
+// length hidden name in the topic's folder `dir`, derived from `name` alone.
+std::filesystem::path temp_path(const std::filesystem::path& dir, std::string_view name);
 
 // Asks the server which topics it has, in name order. Throws ServerError,
 // ProtocolError, or std::system_error / ConnectionClosed.

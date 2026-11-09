@@ -15,12 +15,14 @@
 
 namespace axon::test {
 
-// A real Server over `root` on a free loopback port, running on its own thread.
+// A real Server over `root` on a loopback port (a free one by default),
+// running on its own thread.
 class LiveServer {
 public:
     explicit LiveServer(const std::filesystem::path& root,
-                        ServerConfig config = {.idle_timeout = std::chrono::seconds{5}})
-        : server_{Dataset::scan(root), Listener::listen("127.0.0.1", 0), config},
+                        ServerConfig config = {.idle_timeout = std::chrono::seconds{5}},
+                        std::uint16_t port = 0)
+        : server_{Dataset::scan(root), Listener::listen("127.0.0.1", port), config},
           thread_{[this] { server_.run(); }} {}
     ~LiveServer() { stop(); }
     LiveServer(const LiveServer&) = delete;
