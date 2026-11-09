@@ -284,6 +284,71 @@ TEST_F(ServerTest, SlowReaderDoesNotStallTheSessionsOtherConnections) {
     send_message(quick, Ack{});
 }
 
+TEST_F(ServerTest, ConnectionsThatDropLeaveTheSessionsOthersRunning) {
+    // Far more than the socket buffers hold, so every transfer is still going
+    // when the connections drop.
+    const std::string huge = pattern(20'000'000);
+    write_file(dir_ / "animals" / "huge.bin", huge);   // file id 3
+    write_file(dir_ / "animals" / "huge2.bin", huge);  // file id 4
+    start();
+    const std::uint64_t n = huge.size();
+
+    auto steady = connect();
+    MessageReader rs;
+    const auto ok = std::get<Ok>(ask(steady, rs, Get{.topic = "animals"}));
+    ASSERT_TRUE(ok.files.has_value());
+    ASSERT_EQ(ok.files.value().at(4).name, "huge2.bin");
+    const Get resume{.topic = "animals", .session_id = ok.session_id};
+    const auto join = [&](MessageReader& reader) {
+        auto sock = connect();
+        (void)std::get<Ok>(ask(sock, reader, resume));
+        return sock;
+    };
+    const auto reset = [](Socket& sock) {
+        const linger hard{.l_onoff = 1, .l_linger = 0};
+        ::setsockopt(sock.fd(), SOL_SOCKET, SO_LINGER, &hard, sizeof hard);
+        sock = Socket{};
+    };
+    MessageReader rb;
+    MessageReader unused;
+    auto busy = join(rb);
+    auto idle = join(unused);
+    auto left = join(unused);
+
+    send_message(steady, Req{{{.file_id = 4, .offset = 0, .length = n}}});
+    send_message(busy, Req{{{.file_id = 3, .offset = 0, .length = n}}});
+    std::string got = receive(steady, rs, 4, 0, 2 * max_data_len);
+    std::string part = receive(busy, rb, 3, 0, 2 * max_data_len);
+    // Every way the server sees a connection drop: a reset with data in
+    // flight (send or recv fails, by timing), a reset while idle (recv
+    // fails), a clean close (end of stream).
+    reset(busy);
+    reset(idle);
+    left = Socket{};
+
+    got += receive(steady, rs, 4, got.size(), n - got.size());
+    EXPECT_EQ(got.size(), n);
+    EXPECT_TRUE(got == huge) << "the drops did not disturb the connection still downloading";
+
+    // The session outlives the dropped connections: the busy one's file
+    // resumes on a new connection where its delivery stopped.
+    auto again = connect();
+    MessageReader ra;
+    (void)std::get<Ok>(ask(again, ra, resume));
+    const std::uint64_t at = part.size();
+    send_message(again, Req{{{.file_id = 3, .offset = at, .length = n - at}}});
+    part += receive(again, ra, 3, at, n - at);
+    EXPECT_TRUE(part == huge);
+    send_message(again, Ack{});
+    EXPECT_FALSE(ra.read(again).has_value());
+    EXPECT_FALSE(rs.read(steady).has_value()) << "ACK closes every connection of the session";
+
+    server_->stop();
+    const auto stats = server_->stats();
+    EXPECT_EQ(stats.sessions_finished, 1u);
+    EXPECT_EQ(stats.payload_bytes - stats.redundant_bytes, 2 * n) << "each byte of both files counted once";
+}
+
 TEST_F(ServerTest, PipelinedRequestsAreServedInOrder) {
     start();
     auto sock = connect();
