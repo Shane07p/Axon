@@ -206,12 +206,12 @@ int fetch(std::span<char* const> args) {
          }});
     const double secs = stats.elapsed.count();
     const std::size_t reconnects = stats.connections - 1;
-    const std::uint64_t kept = stats.bytes > stats.received ? stats.bytes - stats.received : 0;
     std::cout << std::format("fetched {}: {} file(s), {} in {:.2f} s ({:.1f} MB/s) into {}{}{}\n",
                              topic, stats.files, human_bytes(stats.bytes), secs,
                              static_cast<double>(stats.received) / 1e6 / std::max(secs, 1e-9),
                              (output / topic).string(),
-                             kept > 0 ? std::format(", {} kept from before", human_bytes(kept)) : "",
+                             stats.kept > 0 ? std::format(", {} kept from before", human_bytes(stats.kept))
+                                            : "",
                              reconnects > 0 ? std::format(", {} reconnect(s)", reconnects) : "");
     return 0;
 }

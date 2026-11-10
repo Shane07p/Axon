@@ -384,6 +384,7 @@ TEST_F(FetchTest, NewSessionKeepsWhatArrivedOfUnchangedFiles) {
     EXPECT_EQ(same.asked, (std::vector<Range>{{.file_id = 1, .offset = 3, .length = 3}}))
         << "a.txt is done, b.txt continues where it stopped";
     EXPECT_EQ(same.stats.received, same.stats.bytes) << "no byte came twice";
+    EXPECT_EQ(same.stats.kept, 9u);
     EXPECT_EQ(read_file(out() / "same" / "a.txt"), "abcdef");
     EXPECT_EQ(read_file(out() / "same" / "b.txt"), "ghijkl");
 
@@ -398,6 +399,7 @@ TEST_F(FetchTest, NewSessionKeepsWhatArrivedOfUnchangedFiles) {
 TEST_F(FetchTest, NewSessionStartsChangedFilesOver) {
     const auto changed = after_lost_session(out(), "changed", {{"a.txt", "abcdef"}, {"b.txt", "GHIJKL"}});
     EXPECT_EQ(changed.asked, (std::vector<Range>{{.file_id = 1, .offset = 0, .length = 6}}));
+    EXPECT_EQ(changed.stats.kept, 6u) << "changed bytes are not counted as retained";
     EXPECT_EQ(read_file(out() / "changed" / "b.txt"), "GHIJKL");
 
     // b.txt is gone from the server: its temporary file goes too.
@@ -442,6 +444,7 @@ TEST_F(FetchTest, ServerRestartMidDownloadKeepsWhatArrived) {
     }
     expect_identical("t");
     EXPECT_EQ(stats.received, stats.bytes) << "what arrived before the restart was not fetched again";
+    EXPECT_GT(stats.kept, 0u);
     server->stop();
     EXPECT_EQ(server->stats().sessions_finished, 1u) << "the download finished on the restarted server";
     EXPECT_LT(server->stats().payload_bytes, stats.bytes);
@@ -851,7 +854,9 @@ TEST_F(FetchTest, RerunResumesTheCheckpointSavedOnFailure) {
             send_frames(sock, content[1], asked.at(0).offset, 1, 1);
             (void)reader.read(sock);
         }};
-        EXPECT_EQ(fetch_from(server.port(), "t").received, 400u);
+        const FetchStats stats = fetch_from(server.port(), "t");
+        EXPECT_EQ(stats.received, 400u);
+        EXPECT_EQ(stats.kept, 604u);
     }
     EXPECT_EQ(asked, (std::vector<Range>{{.file_id = 1, .offset = 600, .length = 400}}));
     EXPECT_EQ(read_file(out() / "t" / "a"), content[0]);

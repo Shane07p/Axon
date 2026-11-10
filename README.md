@@ -8,7 +8,7 @@ going and the transfer resumes from the exact byte.
 
 > Status: work in progress. `axon serve`, `axon list` and `axon fetch` work;
 > a download can use several connections and survives dropped ones, server
-> restarts and client restarts. Next: end-to-end restart demonstrations.
+> restarts and client restarts. Next: detecting files changed during a transfer.
 
 ## Run
 
@@ -66,6 +66,27 @@ progress before reporting the error. Files whose name, size or CRC-32 changed
 on the server start over. The checkpoint is removed when the download succeeds.
 The file names `.axon-state` and `.axon-state.tmp` are reserved for this metadata.
 
+For a client restart, interrupt a large fetch with Ctrl+C after a few seconds,
+then rerun it with the same topic and output folder:
+
+```sh
+axon fetch localhost:9000 animals --output ./downloads
+# Ctrl+C partway through, then:
+axon fetch localhost:9000 animals --output ./downloads
+# fetched animals: ... into downloads/animals, <size> kept from before
+```
+
+For a server restart, leave the fetch running in its terminal. In the server's
+terminal, press Ctrl+C and promptly start it again on the same port:
+
+```sh
+axon serve --root ./datasets --port 9000
+```
+
+The client reconnects automatically and keeps every received byte of unchanged
+files. Its final summary reports `<size> kept from before`. Restart promptly:
+the default retry budget allows roughly five seconds without progress.
+
 ## Build
 
 Requires Linux (or WSL), CMake 3.25+ and a C++20 compiler.
@@ -85,6 +106,8 @@ ctest --test-dir build --output-on-failure
 (`tests/integration/serve_fetch.sh`) that starts the real `axon serve`, runs
 `axon list` and `axon fetch` against it, compares the files with `diff -r`,
 checks the exit codes of error cases and stops the server with Ctrl+C.
+It also kills a client with SIGKILL and reruns it, and restarts a server during
+a fetch; both must preserve progress and produce identical files.
 
 Sanitizer build (AddressSanitizer + UndefinedBehaviorSanitizer):
 

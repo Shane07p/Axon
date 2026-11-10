@@ -158,6 +158,7 @@ private:
 
     // Set while no worker runs, read-only while they do.
     std::uint64_t session_ = 0;
+    std::uint64_t kept_ = 0;
     std::vector<FileEntry> files_;
 
     std::mutex mu_;
@@ -211,7 +212,8 @@ FetchStats Download::run() {
         throw;
     }
     FetchStats stats{
-        .files = files_.size(), .received = received_.load(), .connections = connections_.load()};
+        .files = files_.size(), .received = received_.load(), .kept = kept_,
+        .connections = connections_.load()};
     for (const FileEntry& f : files_) {
         stats.bytes += f.size;
     }
@@ -326,7 +328,9 @@ void Download::adopt(const std::vector<FileEntry>& files) {
     progress_ = std::move(progress);
     todo_.clear();
     done_ = 0;
+    kept_ = 0;
     for (std::uint32_t id = 0; id < files_.size(); ++id) {
+        kept_ += progress_[id].got;
         if (progress_[id].state == FileState::Done) {
             ++done_;
         } else {

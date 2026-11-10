@@ -60,6 +60,7 @@ struct FetchStats {
     std::size_t files = 0;
     std::uint64_t bytes = 0;     // size of the topic
     std::uint64_t received = 0;  // file bytes that came over the network
+    std::uint64_t kept = 0;      // bytes retained when the latest new session opened
     std::size_t connections = 0;
     std::chrono::duration<double> elapsed{};
 };
