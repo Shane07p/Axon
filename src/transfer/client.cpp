@@ -22,6 +22,7 @@
 #include "axon/protocol/bytes.hpp"
 #include "axon/protocol/frame.hpp"
 #include "axon/storage/file.hpp"
+#include "transfer/checkpoint.hpp"
 
 namespace axon {
 namespace {
@@ -94,10 +95,13 @@ enum class FileState { Todo, Busy, Done };
 
 struct FileProgress {
     FileState state = FileState::Todo;  // guarded by Download::mu_
+    std::uint64_t saved = 0;           // durable bytes, guarded by Download::mu_
+    std::uint32_t saved_crc = 0;       // CRC of those bytes, guarded by Download::mu_
     // Touched only by the connection holding the file Busy:
     std::uint64_t got = 0;  // bytes in the temporary file
     std::uint32_t crc = 0;  // CRC-32 of those bytes
     File part{};            // stays open while the file is unfinished
+    Clock::time_point last_sync = Clock::now();
 };
 
 // One download: a session shared by several connections, each on its own
@@ -118,6 +122,9 @@ private:
     };
 
     Link open_session();  // a new session; retried once a session was lost
+    void restore();
+    void checkpoint(bool force = false);  // under mu_, or after every worker has joined
+    void sync_progress(std::uint32_t id);
     void adopt(const std::vector<FileEntry>& files);
     Link connect(const Get& get);
     void work(Link first);
@@ -164,23 +171,44 @@ private:
     bool ack_claimed_ = false;            // guarded by mu_
     std::exception_ptr fatal_;            // guarded by mu_
     std::exception_ptr last_error_;       // guarded by mu_
+    Clock::time_point last_save_ = Clock::now();  // guarded by mu_
 };
 
 FetchStats Download::run() {
     const auto start = Clock::now();
-    for (;;) {
-        work(open_session());
-        // Every worker has finished; nothing else touches the state now.
-        if (fatal_) {
-            std::rethrow_exception(fatal_);
+    restore();
+    try {
+        for (;;) {
+            work(open_session());
+            // Every worker has finished; nothing else touches the state now.
+            if (fatal_) {
+                std::rethrow_exception(fatal_);
+            }
+            if (done_ == files_.size()) {
+                break;
+            }
+            if (!session_lost_) {
+                std::rethrow_exception(last_error_);  // every connection gave up
+            }
+            reset();  // the server forgot the session: open a new one
         }
-        if (done_ == files_.size()) {
-            break;
+        fs::remove(dir_ / ".axon-state");
+    } catch (...) {
+        try {
+            for (std::size_t id = 0; id < progress_.size(); ++id) {
+                FileProgress& p = progress_[id];
+                if (p.part && p.got < files_[id].size) {
+                    p.part.sync();
+                    p.saved = p.got;
+                    p.saved_crc = p.crc;
+                }
+            }
+            if (!files_.empty()) {
+                checkpoint(true);
+            }
+        } catch (const std::exception&) {  // preserve the original failure if the disk cannot save
         }
-        if (!session_lost_) {
-            std::rethrow_exception(last_error_);  // every connection gave up
-        }
-        reset();  // the server forgot the session: open a new one
+        throw;
     }
     FetchStats stats{
         .files = files_.size(), .received = received_.load(), .connections = connections_.load()};
@@ -189,6 +217,51 @@ FetchStats Download::run() {
     }
     stats.elapsed = Clock::now() - start;
     return stats;
+}
+
+void Download::restore() {
+    for (const detail::Saved& s : detail::load_checkpoint(dir_ / ".axon-state")) {
+        files_.push_back(s.entry);
+        FileProgress& p = progress_.emplace_back();
+        try {
+            const bool done = s.have == s.entry.size;
+            const auto path = done ? dir_ / s.entry.name : temp_path(dir_, s.entry.name);
+            const auto size = File::open_read(path).size();
+            if ((done && size == s.entry.size) || (!done && s.have > 0 && size >= s.have)) {
+                p.state = done ? FileState::Done : FileState::Todo;
+                p.got = p.saved = s.have;
+                p.crc = p.saved_crc = s.have_crc;
+            }
+        } catch (const std::system_error&) {  // missing or unusable data starts over
+        }
+    }
+}
+
+void Download::checkpoint(bool force) {
+    const auto now = Clock::now();
+    if (!force && now - last_save_ < std::chrono::seconds{1}) {
+        return;
+    }
+    std::vector<detail::Saved> saved;
+    for (std::size_t id = 0; id < files_.size(); ++id) {
+        saved.push_back({files_[id], progress_[id].saved, progress_[id].saved_crc});
+    }
+    detail::save_checkpoint(dir_ / ".axon-state", saved);
+    last_save_ = now;
+}
+
+void Download::sync_progress(std::uint32_t id) {
+    FileProgress& p = progress_[id];
+    const auto now = Clock::now();
+    if (p.got == files_[id].size || now - p.last_sync < std::chrono::seconds{1}) {
+        return;  // a full file is published only after verification and rename
+    }
+    p.part.sync();
+    p.last_sync = now;
+    const std::lock_guard lock{mu_};
+    p.saved = p.got;
+    p.saved_crc = p.crc;
+    checkpoint();
 }
 
 Download::Link Download::connect(const Get& get) {
@@ -210,6 +283,11 @@ Download::Link Download::open_session() {
             const auto* ok = std::get_if<Ok>(&reply);
             if (ok == nullptr || !ok->files) {
                 protocol_error("expected OK with the file list");
+            }
+            for (const FileEntry& f : *ok->files) {
+                if (f.name == ".axon-state" || f.name == ".axon-state.tmp") {
+                    protocol_error("file name is reserved for download checkpoints");
+                }
             }
             session_ = ok->session_id;
             fs::create_directories(dir_);
@@ -379,7 +457,7 @@ void Download::receive_rest(Link& link, std::uint32_t id, std::uint64_t& receive
     const fs::path part = temp_path(dir_, entry.name);
     if (!p.part) {
         p.part = File::open_write(part);
-        p.part.truncate(p.got);  // p.got is 0 here: drops a stale temp file from an earlier run
+        p.part.truncate(p.got);  // discard bytes newer than the checkpoint (or all of a stale file)
     }
     while (p.got < entry.size) {
         const auto header = read_frame_header(link.sock);
@@ -424,15 +502,18 @@ void Download::receive_rest(Link& link, std::uint32_t id, std::uint64_t& receive
             received += n;
             received_.fetch_add(n, std::memory_order_relaxed);
             left -= n;
+            sync_progress(id);
         }
     }
-    p.part = File{};  // close before renaming or deleting
     if (p.crc != entry.crc) {
+        p.part = File{};
         std::error_code ec;
         fs::remove(part, ec);
         throw IntegrityError(std::format("{} is corrupt: CRC-32 {:08x}, expected {:08x}",
                                          printable(entry.name), p.crc, entry.crc));
     }
+    p.part.sync();
+    p.part = File{};  // close before renaming
     fs::rename(part, dir_ / entry.name);
 }
 
@@ -478,6 +559,9 @@ void Download::give_back(std::vector<std::uint32_t>& ids) {
 void Download::finish_file(std::uint32_t id) {
     {
         const std::lock_guard lock{mu_};
+        progress_[id].saved = progress_[id].got;
+        progress_[id].saved_crc = progress_[id].crc;
+        checkpoint();
         progress_[id].state = FileState::Done;
         ++done_;
     }

@@ -46,6 +46,7 @@ add_library(axon_core
     src/protocol/messages.cpp
     src/storage/dataset.cpp
     src/storage/file.cpp
+    src/transfer/checkpoint.cpp
     src/transfer/client.cpp
     src/transfer/server.cpp
     src/transfer/session.cpp

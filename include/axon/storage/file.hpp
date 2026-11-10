@@ -32,6 +32,7 @@ public:
 
     [[nodiscard]] std::uint64_t size() const;
     void truncate(std::uint64_t length);
+    void sync() const;  // make file contents durable before saving their checkpoint
 
     [[nodiscard]] const std::filesystem::path& path() const noexcept { return path_; }
     [[nodiscard]] int fd() const noexcept { return fd_.get(); }

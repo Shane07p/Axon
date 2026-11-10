@@ -24,6 +24,7 @@
 #include "axon/net/socket.hpp"
 #include "axon/protocol/frame.hpp"
 #include "axon/transfer/client.hpp"
+#include "transfer/checkpoint.hpp"
 #include "test_servers.hpp"
 #include "test_util.hpp"
 
@@ -766,7 +767,8 @@ TEST_F(FetchTest, CorruptFileIsRejectedAndNotKept) {
     const FakeServer server = serve_one_file({"x.txt", 3, crc_of(content) ^ 1},
                                              {.file_id = 0, .offset = 0, .bytes = bytes(content)});
     EXPECT_THROW((void)fetch_from(server.port(), "t"), axon::IntegrityError);
-    EXPECT_TRUE(listing(out() / "t").empty()) << "neither x.txt nor its .part may remain";
+    EXPECT_EQ(listing(out() / "t"), std::vector<std::string>{".axon-state"})
+        << "neither x.txt nor its .part may remain";
 }
 
 TEST_F(FetchTest, DataAtTheWrongOffsetIsAProtocolError) {
@@ -811,6 +813,148 @@ TEST_F(FetchTest, ServerErrorTextCannotInjectTerminalCodes) {
         FAIL() << "fetch should have failed";
     } catch (const axon::ServerError& e) {
         EXPECT_EQ(std::string_view{e.what()}, "server refused: INTERNAL: bad?[2Jthing?");
+    }
+}
+
+TEST_F(FetchTest, RerunResumesTheCheckpointSavedOnFailure) {
+    const std::vector<std::string> content{"done", patterned(1000)};
+    const std::vector<FileEntry> files{{"a", 4, crc_of(content[0])}, {"b", 1000, crc_of(content[1])}};
+    {
+        const FakeServer server{[&](Socket& sock, int i) {
+            MessageReader reader;
+            (void)reader.read(sock);
+            send_message(sock, Ok{.session_id = 7, .files = files});
+            if (i == 0) {
+                (void)reader.read(sock);
+                send_message(sock, Data{.file_id = 0, .bytes = bytes(content[0])});
+                send_truncated(sock, Data{.file_id = 1, .bytes = bytes(content[1])}, data_header_len + 600);
+            }
+        }, 2};
+        EXPECT_THROW((void)axon::fetch({.host = "127.0.0.1", .port = server.port(), .topic = "t",
+                                        .output = out(), .timeout = 5s,
+                                        .retry = {.max_failures = 1, .first_delay = 1ms, .max_delay = 1ms}}),
+                     axon::ConnectionClosed);
+    }
+    const auto state = out() / "t" / ".axon-state";
+    const auto saved = axon::detail::load_checkpoint(state);
+    ASSERT_EQ(saved.size(), 2u);
+    EXPECT_EQ(saved[0].have, 4u);
+    EXPECT_EQ(saved[1].have, 600u);
+    EXPECT_EQ(saved[1].have_crc, crc_of(std::string_view{content[1]}.substr(0, 600)));
+    std::vector<Range> asked;
+    {
+        const FakeServer server{[&](Socket& sock) {
+            MessageReader reader;
+            EXPECT_EQ(std::get<Get>(*reader.read(sock)).session_id, 0u);
+            send_message(sock, Ok{.session_id = 8, .files = files});
+            asked = std::get<Req>(*reader.read(sock)).ranges;
+            send_frames(sock, content[1], asked.at(0).offset, 1, 1);
+            (void)reader.read(sock);
+        }};
+        EXPECT_EQ(fetch_from(server.port(), "t").received, 400u);
+    }
+    EXPECT_EQ(asked, (std::vector<Range>{{.file_id = 1, .offset = 600, .length = 400}}));
+    EXPECT_EQ(read_file(out() / "t" / "a"), content[0]);
+    EXPECT_EQ(read_file(out() / "t" / "b"), content[1]);
+    EXPECT_FALSE(fs::exists(state));
+}
+
+TEST_F(FetchTest, CheckpointBehindTheTemporaryFileDiscardsTheUnsavedTail) {
+    const std::string content = patterned(1000);
+    const FileEntry entry{"x", content.size(), crc_of(content)};
+    write_file(axon::temp_path(out() / "t", "x"), content.substr(0, 600) + std::string(600, '?'));
+    const std::vector<axon::detail::Saved> saved{{entry, 600, crc_of(content.substr(0, 600))}};
+    axon::detail::save_checkpoint(out() / "t" / ".axon-state", saved);
+    std::uint64_t offset = 0;
+    {
+        const FakeServer server{[&](Socket& sock) {
+            MessageReader reader;
+            (void)reader.read(sock);
+            send_message(sock, Ok{.session_id = 8, .files = std::vector<FileEntry>{entry}});
+            offset = std::get<Req>(*reader.read(sock)).ranges.at(0).offset;
+            send_frames(sock, content, offset, 1);
+            (void)reader.read(sock);
+        }};
+        EXPECT_EQ(fetch_from(server.port(), "t").received, 400u);
+    }
+    EXPECT_EQ(offset, 600u);
+    EXPECT_EQ(read_file(out() / "t" / "x"), content);
+    EXPECT_FALSE(fs::exists(out() / "t" / ".axon-state"));
+}
+
+TEST_F(FetchTest, InvalidOrUnusableSavedFilesStartOver) {
+    const FileEntry entry{"x", 6, crc_of("abcdef")};
+    for (int kind = 0; kind < 6; ++kind) {
+        SCOPED_TRACE(kind);
+        fs::remove_all(out());
+        const auto dir = out() / "t";
+        fs::create_directories(dir);
+        auto old = entry;
+        if (kind == 1) {
+            old.crc ^= 1;  // changed on the server, same size
+        }
+        const std::vector<axon::detail::Saved> saved{{old, kind >= 4 ? 6u : 3u, crc_of("abc")}};
+        axon::detail::save_checkpoint(dir / ".axon-state", saved);
+        if (kind == 0) {
+            write_file(dir / ".axon-state", "damaged");
+        }
+        if (kind <= 1 || kind == 3) {
+            write_file(axon::temp_path(dir, "x"), kind == 3 ? "ab" : "abc");
+        }
+        if (kind == 5) {
+            write_file(dir / "x", "wrong size");
+        }
+        const FakeServer server{[&](Socket& sock) {
+            MessageReader reader;
+            (void)reader.read(sock);
+            send_message(sock, Ok{.session_id = 8, .files = std::vector<FileEntry>{entry}});
+            EXPECT_EQ(std::get<Req>(*reader.read(sock)).ranges.at(0).offset, 0u);
+            send_message(sock, Data{.bytes = bytes("abcdef")});
+            (void)reader.read(sock);
+        }};
+        EXPECT_EQ(fetch_from(server.port(), "t").received, 6u);
+        EXPECT_EQ(read_file(dir / "x"), "abcdef");
+        EXPECT_FALSE(fs::exists(dir / ".axon-state"));
+    }
+}
+
+TEST_F(FetchTest, CheckpointIsPublishedWhileTheDownloadIsStillRunning) {
+    const FileEntry entry{"x", 6, crc_of("abcdef")};
+    std::vector<axon::detail::Saved> during;
+    {
+        const FakeServer server{[&](Socket& sock) {
+            MessageReader reader;
+            (void)reader.read(sock);
+            send_message(sock, Ok{.session_id = 7, .files = std::vector<FileEntry>{entry}});
+            (void)reader.read(sock);
+            std::this_thread::sleep_for(1100ms);  // cross the checkpoint interval
+            send_message(sock, Data{.bytes = bytes("abc")});
+            const auto until = std::chrono::steady_clock::now() + 5s;
+            do {
+                during = axon::detail::load_checkpoint(out() / "t" / ".axon-state");
+                if (!during.empty()) {
+                    break;
+                }
+                std::this_thread::sleep_for(1ms);
+            } while (std::chrono::steady_clock::now() < until);
+            send_message(sock, Data{.offset = 3, .bytes = bytes("def")});
+            (void)reader.read(sock);
+        }};
+        (void)fetch_from(server.port(), "t");
+    }
+    ASSERT_EQ(during.size(), 1u);
+    EXPECT_EQ(during[0], (axon::detail::Saved{entry, 3, crc_of("abc")}));
+    EXPECT_FALSE(fs::exists(out() / "t" / ".axon-state"));
+}
+
+TEST_F(FetchTest, CheckpointNamesCannotBeOverwrittenByDownloadedFiles) {
+    for (const std::string name : {".axon-state", ".axon-state.tmp"}) {
+        const FakeServer server{[&](Socket& sock) {
+            MessageReader reader;
+            (void)reader.read(sock);
+            send_message(sock, Ok{.session_id = 7, .files = std::vector<FileEntry>{{name, 0, 0}}});
+        }};
+        EXPECT_THROW((void)fetch_from(server.port(), "t"), axon::ProtocolError);
     }
 }
 

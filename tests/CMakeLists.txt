@@ -12,6 +12,7 @@ include(GoogleTest)
 
 add_executable(axon_unit_tests
     unit/bytes_test.cpp
+    unit/checkpoint_test.cpp
     unit/client_test.cpp
     unit/crc32_test.cpp
     unit/dataset_test.cpp

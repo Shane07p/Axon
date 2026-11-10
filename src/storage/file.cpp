@@ -88,4 +88,12 @@ void File::truncate(std::uint64_t length) {
     }
 }
 
+void File::sync() const {
+    while (::fdatasync(fd_.get()) != 0) {
+        if (errno != EINTR) {
+            detail::throw_errno("fdatasync", path_.native());
+        }
+    }
+}
+
 }  // namespace axon

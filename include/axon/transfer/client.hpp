@@ -79,6 +79,8 @@ struct FetchStats {
 // restarted, say), a new session is opened, and every file whose name, size
 // and CRC-32 are unchanged keeps what was already downloaded; the others start
 // over. The very first connect is not retried, so a wrong address fails at once.
+// Progress is checkpointed about once a second and on failure; rerunning fetch
+// keeps saved data for unchanged files, including files already completed.
 //
 // Throws std::invalid_argument for an invalid topic name, ServerError,
 // ProtocolError, IntegrityError, std::system_error for disk errors, and

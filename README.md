@@ -7,8 +7,8 @@ several TCP connections into one download, and if one is cut the others keep
 going and the transfer resumes from the exact byte.
 
 > Status: work in progress. `axon serve`, `axon list` and `axon fetch` work;
-> a download can use several connections and survives dropped ones. Next:
-> resuming after the client or server restarts.
+> a download can use several connections and survives dropped ones, server
+> restarts and client restarts. Next: end-to-end restart demonstrations.
 
 ## Run
 
@@ -57,6 +57,14 @@ axon fetch localhost:9000 animals --output ./downloads --connections 4
 # ...
 # fetched animals: ... into downloads/animals, <k> reconnect(s)
 ```
+
+Rerun the same `axon fetch` command after an interruption to resume. While
+downloading, Axon saves progress about once a second in
+`downloads/animals/.axon-state`; a crash may require downloading the bytes
+since the last checkpoint again. If a fetch gives up, it saves the exact
+progress before reporting the error. Files whose name, size or CRC-32 changed
+on the server start over. The checkpoint is removed when the download succeeds.
+The file names `.axon-state` and `.axon-state.tmp` are reserved for this metadata.
 
 ## Build
 
